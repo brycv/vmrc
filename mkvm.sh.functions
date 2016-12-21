@@ -2,7 +2,7 @@
 #
 ################################################################ LICENSE
 #
-# Copyright (c) 2012-2014 Michael Dexter <editor@callfortesting.org>
+# Copyright (c) 2012-2016 Michael Dexter <editor@callfortesting.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -19,7 +19,7 @@
 ############################################################ INFORMATION
 # 
 # Title: make VM script function library
-# Version: v.0.7
+# Version: v.0.9.3
 #
 # Functions used by the mkvm.sh Virtual Machine provisioning script
 #
@@ -86,14 +86,20 @@ f_wipe_dev() ## $1 dev ## - Wipe everything possible from a device
 
 # PARTITIONING
 
-# How about a check-alignment function?
 # Optional data partitions would require sizes for all
 
-# Steps:
+# Verify if a device has aligned gpart partitions
+f_check_gpt_alignment() ## $1 dev ##
+{
+	exitcode="0" # Mathematical answer that doubles as a return value
 
-# Create layout
-# Create boot slice/partition
-# Create data slice/partition and newfs it (bootable for mbr)
+for alignment in $( gpart backup $1 | tail -n +2 | cut -d " " -f 3 ); do
+        result=$( echo "$alignment % 8" | bc )
+        exitcode=$(( $exitcode+$result )) # Add any non-zero results to total
+done
+
+return $exitcode
+}
 
 # Create a traditional fdisk/MBR layout
 f_fdisk_mbr_layout_preflight() ## $1 dev ##
@@ -611,7 +617,7 @@ f_gpart_gpt_zpool_preflight() ## $1 dev $2 pool name $3 mount point ##
 	[ -e $1 ] || echo Mount point $3 does not exist.
 	ls $3
 	echo You entered $2 and $3
-	echo CreatingPool
+	echo Creating Pool
 }
 
 f_gpart_gpt_zpool() ## $1 dev $2 pool name $3 mount point ##
@@ -974,7 +980,7 @@ f_set_password_preflight() ##  ##
 
 f_set_password() ## $1 password $2 mount point ##
 {
-	echo $1 | pw -V ${2}/etc/ usermod root -h 0
+	echo "$1" | pw -V ${2}/etc/ usermod root -h 0
 }
 
 f_set_password_debug() ## $1 mount point ##
@@ -982,28 +988,31 @@ f_set_password_debug() ## $1 mount point ##
 	echo set_password_post
 }
 
-# f_getnextid
+# f_checkconflicts
 #
-# Get the next available VMID in ~/vmrc/vm/
+# Check for conflicting VM IDs
 #
-# BUG: Is this triple digit safe?
-f_getnextid() ## $1 vhost_vmdir from /usr/local/etc/vm.conf
+f_checkconflicts() ## $1 host_vmdir from /usr/local/etc/vm.conf
 {
-		local nextid=0 # Initialize to 0
-
 	if [ $( ls $1 | wc -l ) = 0 ]; then # None exist. A better test?
-		echo $nextid # Use the initialized zero
-		exit
-	else
-		for vm_found in ${1}/*; do			 # Full path name
-			vm_foundname="${vm_found##*/}" # Strip path
-			vm_foundid="${vm_foundname##*[!0-9]}"
-			if [ $vm_foundid -gt $nextid ]; then
-				nextid=$vm_foundid
+		echo No VMs in ${1}. Exiting
+		exit 0
+	fi
+
+local conflict=""
+
+# Loop through and check all VMs for each VM found
+	for vm_found in ${1}/* ; do # Full path name
+		vm_foundname="${vm_found##*/}" # Strip path
+		vm_foundid="${vm_foundname##*[!0-9]}"
+		for vm_check in ${1}/* ; do # Full path name
+			vm_checkname="${vm_check##*/}" # Strip path
+			vm_checkid="${vm_checkname##*[!0-9]}"
+			if [ "$vm_foundname" = "$vm_checkname" ]; then
+				continue # Ignore self
+			elif [ "$vm_foundid" = "$vm_checkid" ]; then
+			echo VMs $vm_foundname and $vm_checkname conflict!
 			fi
 		done
-	fi
-		nextid=$(($nextid+1))
-		echo $nextid
+	done
 }
-

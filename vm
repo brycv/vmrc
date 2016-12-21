@@ -2,7 +2,7 @@
 #
 ################################################################ LICENSE
 #
-# Copyright (c) 2012-2014 Michael Dexter <editor@callfortesting.org>
+# Copyright (c) 2012-2016 Michael Dexter <editor@callfortesting.org>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -19,1351 +19,1322 @@
 ############################################################ INFORMATION
 #
 # Title: virtual machine rc script
-# Version: v.0.7
+# Version: v.0.9.7
 #
-# rc(8) command script for managing virtual machines.
-#
-############################################################# RCORDER(8)
-
-# See rcorder(8) for additional information
-
-# PROVIDE: bhyve
-# REQUIRE: LOGIN hostname
+# PROVIDE: vm
+# REQUIRE: DAEMON
 # KEYWORD: shutdown
-
-################################################################## RC(8)
-
-# See rc(8) for additional information.
+#
+# Add the following line to /etc/rc.conf to enable vmrc:
+#
+# vm_enable="YES"
 
 . /etc/rc.subr
 
 name="vm"
-rcvar="vm_enable"
-#load_rc_config "$name" # Test me
-start_cmd=${name}_start
-stop_cmd=${name}_stop
-restart_cmd=${name}_restart
-extra_commands="
-	attach
-	boot
-	debug
-	delete
-	grub
-	iso
-	jail
-	load
-	mount
-	qemu
-	status
-	umount
-" # END-QUOTE
-attach_cmd=${name}_attach
-boot_cmd=${name}_boot
-debug_cmd=${name}_debug
-delete_cmd=${name}_delete
-grub_cmd=${name}_grub
-iso_cmd=${name}_iso
-jail_cmd=${name}_jail
-load_cmd=${name}_load
-mount_cmd=${name}_mount
-qemu_cmd=${name}_qemu
-status_cmd=${name}_status
-umount_cmd=${name}_umount
+rcvar="${name}_enable"
 
-###################################################### UTILITY FUNCTIONS
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+#restart_cmd="${name}_restart"
+status_cmd="${name}_status"
+
+# NB! sync_these
+extra_commands="
+#	status
+	list
+	attach
+	vnc
+	dryrun
+	dryruninstall
+	dryboot
+	install
+	livecd
+	dryrunlivecd
+	grub
+	bhyve
+	bhyveinstall
+	qemu
+	xen
+	xeninstall
+" # END-QUOTE
+
+# Removed extra commands
+#	reset # Hard Stop and Start
+#	debug # Some code remains
+#	delete
+#	mount # Some code remains
+#	umount # Some code remains
+#	reset # Hard Stop and Start
+#	debug # Some code remains. Xen equivalent?
+#	jail, vbox # Some code remains for jail
+
+# NB! sync_these
+attach_cmd="vm_attach"
+vnc_cmd="vm_vnc"
+list_cmd="vm_list"
+# Overrides
+dryrun_cmd="vm_start"
+dryruninstall_cmd="vm_start"
+dryboot_cmd="vm_start"
+install_cmd="vm_start"
+livecd_cmd="vm_start"
+dryrunlivecd_cmd="vm_start"
+grub_cmd="vm_start"
+bhyve_cmd="vm_start"
+bhyveinstall_cmd="vm_start"
+qemu_cmd="vm_start"
+xen_cmd="vm_start"
+xeninstall_cmd="vm_start"
+
+############################################################# SUPPORT FUNCTIONS
 
 f_timestamp() # A simple timestamp for logging. Modify as desired.
 {
-echo $( date "+%Y-%m-%d %H:%M:%S:" )
+	echo $( date "+%Y-%m-%d %H:%M:%S:" )
 }
 
-f_getmdname() # vm_name # Retrieve md(4) IDs associated with $1 ($vm_name)
+f_info() # $1 # A redirectable replacement for echo for information reporting
+# NB! f_info input must be surrounded by quotation marks
 {
-#	mdconfig -lv | awk -v vm_name="$1" \
-#		'$0 ~ "^[^/]*/" vm_name "\.img$" { print $1 }'
-	local local_img_name=$1 # Takes vm_name, lacks `.img' suffix
-	mdconfig -lv | awk -v local_vmname="$local_img_name" '
-	{
-		md=$1
-		sub("^[^/]*", "")
-		if ($0 ~ "/" local_vmname "\.img$")
-			print md
-	}'
-}
-
-f_mddestroy() # $1 ($vm_name) Destroy multiple md(4) IDs of $vm_name
-{
-	echo
-	echo Destroying all memory devices associated with $1
-	for dev in $( f_getmdname $1 ); do
-		echo Destroying mdconfig device $dev
-		mdconfig -du "$dev"
-	done
-}
-
-########################################################## SUB FUNCTIONS
-
-f_load() # $host_vmdir $vm_names ($1)
-{
-echo
-echo Verifying if $1 is already loaded
-	[ -e /dev/vmm/$1 ] && \
-	{ echo $1 is already loaded. Skipping ; return 1 ; }
-
-# Avoid extra path slashes else grep will fail
-echo
-echo Verifying if $1 is already mounted on $host_vmdir$1/mnt
-		mount | grep -qw $1/mnt && \
-		{ echo $1 is mounted. Skipping ; return 1 ; }
-
-echo
-echo Verifying if the host CPU has EPT support
-	grep -qw POPCNT /var/run/dmesg.boot || \
-	{ echo CPU does not feature EPT support. Exiting ; exit 1 ; }
-
-echo
-echo Verifying if vmm.ko is loaded and loading if necessary
-	kldstat | grep -qw vmm.ko || \
-	{ echo vmm.ko not loaded. Loading ; \
-	kldload vmm ; } || \
-	{ echo vmm.ko failed to load. Exiting ; exit 1 ; }
-
-echo
-echo Verifying if bridgestp.ko is loaded and loading if necessary
-	kldstat | grep -qw bridgestp.ko || \
-	{ echo bridgestp.ko not loaded. Loading ; \
-	kldload bridgestp ; } || \
-	{ echo bridgestp.ko failed to load. Skipping ; return 1 ; }
-
-echo
-echo Verifying if if_bridge.ko is loaded and loading if necessary
-	kldstat | grep -qw if_bridge.ko || \
-	{ echo if_bridge.ko not loaded. Loading ; \
-	kldload if_bridge ; } || \
-	{ echo if_bridge.ko failed to load. Skipping ; return 1 ; }
-
-echo
-echo Verifying if the host network bridge is up
-if [ ! "$( ifconfig | grep bridge$host_bridge )" ]; then
-		echo Running ifconfig bridge$host_bridge create
-		ifconfig bridge$host_bridge create
-	echo
-	echo Associating the host NIC with the host network bridge
-		ifconfig bridge$host_bridge addm $host_nic up
-fi
-
-echo
-echo Verifying if if_tap.ko is loaded and loading if necessary
-	kldstat | grep -qw if_tap.ko || \
-	{ echo if_tap.ko not loaded. Loading ; \
-	kldload if_tap ; } || \
-	{ echo if_tap.ko failed to load. Skipping ; return 1 ; }
-
-echo
-echo Checking the net.link.tap.user_open sysctl
-if [ $(sysctl -n net.link.tap.up_on_open) = "0" ]; then
-	echo Setting net.link.tap.user_open sysctl to 1
-	sysctl net.link.tap.up_on_open=1
-fi
-
-# NB! "." exits on error! redirecting errors and checking results
-# .: cannot open /usr/local/vmrc/vm//vm7/vm7.confx: No such file or directory
-# FIX: First make sure the file is present, ideally syntax check it!
-
-echo
-echo Reading the $host_vmdir/$1/${1}.conf config file
-	[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-	[ $vm_os_type ] || \
-	{ echo $host_vmdir/$1/${1}.conf failed to source. Exiting ; exit 1 ; }
-
-# Initializing $vm_device variable (bhyve supports disk images and block devs)
-
-echo
-echo Checking if we are in ISO boot mode
-		[ "$iso_boot" = "isobootyes" ] &&
-		vm_dev_type="iso"
-
-echo
-echo Setting the vm_device variable
-case $vm_dev_type in # device and malloc are already set
-	device) echo prefixing $vm_device from the VM config file with /dev
-		vm_device=/dev/$vm_device
-		;;
-	malloc) echo prefixing $vm_device from the VM config file with /dev
-				vm_device=/dev/$vm_device
-				;;
-	img) vm_device=$host_vmdir/$1/${1}.img ;;
-		iso) vm_device=$host_vmdir/$1/${1}.iso ;;
-	zvol) vm_device=/dev/zvol/${host_zpool}/$1 ;;
-	*) echo vm_dev_type was not set. Exiting ; exit 1
+case $info_method in
+	stdio) # Log to standard I/O
+		echo $1 # Consider an echo or carriage return before
+	;;
+	quiet) # Silence is golden
+		true $1
+	;;
+	logger) # Log to the system logger (console and /var/log/messages)
+		logger "vmrc: $1"
 esac
+} # End f_info
 
-echo
-echo Determining if fsck should be run
-
-if [ "$vm_os_type" = "freebsd" -a "$vm_dev_fs" = "ufs" ]; then
-	echo Running fsck on the FreeBSD boot partition $vm_device
-
-		case $vm_dev_type in
-		img)
-			echo
-			echo Verifying if $vm_device exists
-			[ -f $vm_device ] || \
-			{ echo $vm_device is missing. Skipping ; return 1 ; }
-			echo
-			echo Detaching any previous memory device attachments
-			f_mddestroy $1
-			echo
-			echo Attempting to attach $vm_device
-			dev_to_fsck=$( mdconfig -af $vm_device )
-			[ -e /dev/$dev_to_fsck ] ||
-		{ echo $vm_device did not attach. Skipping ; return 1 ; }
-			echo
-			echo Running fsck
-			fsck_ufs -y /dev/$dev_to_fsck$vm_dev_root
-			echo
-			echo Detaching $vm_device
-			f_mddestroy $1 #$vm_name
-# FIX: Q: Should this be f_mddestroying $dev_to_fsck or all associated?
-		;;
-		zvol|device|malloc)
-			echo
-			echo Verifying that $vm_device exists
-			[ -e $vm_device ] || \
-						{ echo $vm_device is missing. Skipping ; return 1 ; }
-						echo
-						echo Running fsck
-						fsck_ufs -y $vm_device$vm_dev_root
-	esac
-fi
-
-#if [ $vm_dev_fs="zfs" ]; then
-#	echo
-#	echo Verifying that VM zpool is not imported
-#	...
-#fi
-
-# Only checking for "freebsd", grub will be used otherwise
-
-echo
-echo Determining whether to use bhyveload or grub-bhyve
-if [ "$vm_os_type" = "freebsd" ]; then
-
-		if [ "$vm_dev_type" = "img" ]; then
-				echo Detaching any previous memory device attachments
-				f_mddestroy $1
-		fi
-
-# $vm_device will be ~.iso if in isoboot - fine for FreeBSD
-
-	echo
-	echo Using bhyveload
-	local bhyveload_cmd="/usr/sbin/bhyveload -m $vm_ram -d $vm_device $1"
-	echo
-	echo Running the bhyveload command:
-	echo
-	echo $bhyveload_cmd
-	echo
-	echo $bhyveload_cmd > $host_vmdir/$1/bhyveload_cmd.sh
-	local timestamp=$( f_timestamp )
-	echo $timestamp $bhyveload_cmd >> $host_vmdir/$1/${1}.log
-
-	eval $bhyveload_cmd
-
-else # Use grub-bhyve
-
-	echo
-	echo Using grub-bhyve and checking if installed
-		[ -x /usr/local/sbin/grub-bhyve ] || \
-{ echo "grub-bhyve is missing \(ports/sysutils/grub2-bhyve\)" ; return 1 ; }
-
-# Note that we do not set the iso as $vm_device because grub will handle this
-	echo
-		echo Creating $host_vmdir/$1/device.map
-		echo "(hd0) $host_vmdir/$1/${1}.img" > $host_vmdir/$1/device.map 
-
-# The ISO *should* be there but this check will avoid breakage
-	echo
-	echo Checking if we are in ISO boot mode
-		[ "$iso_boot" = "isobootyes" ] && echo Confirmed ;
-		echo "(cd0) $host_vmdir/$1/${1}.iso" >> $host_vmdir/$1/device.map
-
-		echo
-		echo Using the device.map:
-		cat $host_vmdir/$1/device.map
-
-		if [ "$iso_boot" = "isobootyes" ]; then
-			echo
-			echo Generating the $1 grub.cfg # From the config file
-			echo -e $iso_grub_cfg > $host_vmdir/$1/grub.cfg || \
-					{ echo grub.cfg generation failed ; return 1 ; } 
-
-		grub_load_cmd="/usr/local/sbin/grub-bhyve $iso_grub_d $iso_grub_r -m $host_vmdir/$1/device.map -M $vm_ram $1"
-
-	else # Non-ISO boot
-
-		echo
-		echo Generating the $1 grub.cfg # From the config file
-		echo -e $img_grub_cfg > $host_vmdir/$1/grub.cfg || \
-			{ echo grub.cfg generation failed ; return 1 ; }
-
-		grub_load_cmd="/usr/local/sbin/grub-bhyve $img_grub_d $img_grub_r -m $host_vmdir/$1/device.map -M $vm_ram $1"
-
-	fi
-
-		echo
-		echo Using the grub.cfg:
-		cat $host_vmdir/$1/grub.cfg
-
-	local timestamp=$( f_timestamp )
-	echo $timestamp $grub_load_cmd >> $host_vmdir/$1/${1}.log
-
-	echo
-	echo Running the grub-bhyve command:
-	echo $grub_load_cmd
-	echo
-	echo $grub_load_cmd > $host_vmdir/$1/grub-bhyve_cmd.sh
-		echo "service vm onestop $1" > $host_vmdir/$1/stop_cmd.sh
-
-	export TERM=xterm
-	eval $grub_load_cmd
-fi
-
-[ -e /dev/vmm/$1 ] || echo VM $1 failed to load # Combine these?
-[ -e /dev/vmm/$1 ] && echo VM $1 appears to have loaded successfully
-} # end f_load
-
-
-f_boot () # $host_vmdir $found ($1) ($vm_name from the multi-argument loop)
+f_error() # $1 # A redirectable replacement for echo for error reporting
+# NB! f_error input must be surrounded by quotation marks
 {
-		[ -e /dev/vmm/$1 ] || \
-	{ echo VM $1 is not loaded. Skipping ; return 1 ; }
+case $error_method in
+	stdio) # Log to standard I/O
+		echo $1 # Consider an echo or carriage return before
+	;;
+	quiet) # Silence is golden
+		true $1
+	;;
+	logger) # Log to the system logger (console and /var/log/messages)
+		logger vmrc: $1
+esac
+} # End f_error
 
-#	vm_id="${1#${1%[0-9]*}}" # vm2 -> 2
-	vm_id=${1##*[!0-9]}
+f_readconf() # $1 # shell variables file # '.' source command with safety checks
+{
+# Preflight checks for '.' source command because it exits on failure
+	[ -r $1 ] || return 1
+	sh -n $1 >/dev/null 2>&1 || return 1
+	. $1 >/dev/null 2>&1 || return 1
+} # End f_readconf
 
-	echo
-	echo Reading the $host_vmdir/$1/${1}.conf config file
-	[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-	[ $vm_os_type ] || \
-{ echo $host_vmdir/$1/${1}.conf failed to source. Skipping ; return 1 ; }
+f_check_vmid_conflicts() # Check for conflicting VM IDs in $host_vmdir
+{
+local vmid_list=""
+	for vmfound in ${host_vmdir}/* ; do
+		vmname="${vmfound##*/}" # Remove path, leaving VM name
+		vmid=${vmname##*[!0-9]} # Remove name, leaving VM ID
 
-# Setting up VM PCI devices:
+		[ -z $vmid ] || vmid_list="${vmid_list}\n$vmid" # A number
+	done
+	vmid_list=$( echo -e $vmid_list | sort -g | uniq -d ) # Find conflicts
+[ "$vmid_list" = "" ] || \
+	{ f_error "Conflicting VM IDs: ${vmid_list}. Exiting" ; exit 1 ; }
+} # End f_check_vmid_conflicts
 
-# 0 hostbridge
-# 2 boot block device
-# 3:0-7 virtual network devices
-# 4 optional ISO block device
-# 5 console
-# 6:0-7 additional storage devices
+f_check_vm_started() # $1 # Check if a given VM name is started under any containre
+{
+	vmname="$1"
 
-# Note that PCI devices can be single digit 0, or 0:0 with a limit of 8 total
-# Simply add another device if 8 is not enough: 7:[0-7] etc.
-
-		case $vm_dev_type in
-		device|malloc)
-	echo
-	echo Checking for $vm_device and prefixing with /dev
-	if [ -e /dev/$vm_device ]; then
-		 vm_device=/dev/$vm_device
+	if [ -e /dev/vmm/$vmname ]; then
+		return 0
 	else
-		echo Device $vm_device missing. Skipping ; return 1
+		return 1
 	fi
-		;;
+
+	ps axwww | grep -v rc.d | grep -v grep | grep $vmname >/dev/null 2>&1
+	return $?
+# NB! Making the reckless assumption that each container will have a process
+# with vmname in it for now
+# NB! WE ARE ONLY RETURNING EXIT CODES, NO PRINTED MESSAGES HERE
+# NB! We should be able to do this only by VM Name
+# NB! TRY all supported hypervisors because of the ability to override them
+# bhyve, Xen, VBox, jail, QEMU
+# Leave a flag for loaded kernel-based hypervisors to quickly eliminate many
+# Do not grep for the grep process grepping for the VM Name or rc.d process
+#	ps ax | grep -v grep | grep -qw "$vmname" && return 1
+# NB! FYI on Xen ps ax: # xl -vvvv create -c /vmrc/vm/fbsd101amd64_raw22/xen.cfg
+
+} # End f_check_vm_started
+
+f_limit_one_vm() # $vmcount # Only operate on one VM for some functions
+{
+	case $vmcount in # Initialized in MAIN based on rc directives
+	0) f_error "Please specify a single VM by name"
+		exit 1
+	;;
+	1) return 0
+	;;
+	*) f_error "Please specify a single VM by name"
+		exit 1
+	esac
+} # End f_limit_one_vm
+
+# NB! These would be used by mount/umount for image-based boot images
+#f_getmdname() # vmname # Retrieve md(4) IDs associated with $1 ($vmname)
+#{
+##	mdconfig -lv | awk -v vmname="$1" \
+##		'$0 ~ "^[^/]*/" vmname "\.img$" { print $1 }'
+#	local local_img_name=$1 # Takes vmname, lacks `.img' suffix
+#	mdconfig -lv | awk -v local_vmname="$local_img_name" '
+#	{
+#		md=$1
+#		sub("^[^/]*", "")
+#		if ($0 ~ "/" local_vmname "\.img$")
+#			print md
+#	}'
+#}
+
+#f_mddestroy() # $1 ($vmname) Destroy multiple md(4) IDs of $vmname
+#{
+#	f_info "Destroying all memory devices associated with $1"
+#	for dev in $( f_getmdname $1 ); do
+#		f_info "Destroying mdconfig device $dev"
+#		mdconfig -du "$dev"
+#	done
+#}
+
+f_vm_prep() # $vmname # Generates all VM config files and boot script
+{
+
+	# Setting $1 to vmname for clarity
+	vmname="$1"
+	vmid=${vmname##*[!0-9]} # Remove name, leaving VM ID
+
+# ASSUMPTIONS: VM directory is ready and All VM variables are set in the shell
+# Set by f_readconf by f_start
+
+# NB! Push this to the calling function?
+[ "$dryboot" = "YES" ] && \
+	{ f_info "Dry boot with no script generation" ; return 0 ; }
+
+bootscript="$host_vmdir/$vmname/$vm_container.sh"
+
+	case $vm_container in
+		bhyve)
+# Boot script boilerplate
+	echo "#!/bin/sh" > $bootscript
+	echo "# Autogenerated by vmrc /usr/local/etc/rc.d/vm" >> $bootscript
+
+# NB! The bridge modifications can stall all networking. By checking for each
+# device and only creating them if necessary, the operator can create them
+# in /etc/rc.conf and this will automatically use them.
+
+# Check if vmm is loaded. Check for success?
+
+	echo "kldstat | grep -qw "vmm.ko" || \\" >> $bootscript
+	echo "	kldload vmm > /dev/null 2>&1" >> $bootscript
+	echo "" >> $bootscript
+
+# NB! We could test of this but that would require more commands
+# The user should set it globally but we can't rely on that
+# We would "up" each tap device on reboot but that would be complex with
+# multiple tap devices. Let's see if this impacts other VMs.
+
+	echo "sysctl net.link.tap.up_on_open=1 > /dev/null 2>&1" \
+		>> $bootscript
+
+	echo "" >> $bootscript
+
+# Network bridge and tap device configuration
+
+# End goal:
+# ifconfig bridge0 create ether <MAC> mtu 1600 description "woah dude" up
+# ifconfig tap0 create ether <MAC> mtu 1600 description "woah dude" up
+
+# Initialize variables from configuration file to enter the ifconfig loop with
+
+# System: tap|vmnet<prefix 8~9><VM ID><NIC count 0~7>
+two_digit_vmid="$(printf "%02i" "$vmid")" # vm2 "2" -> 02 for tap8020
+nic_prefix=8
+nic_count=0 # Counter for NIC device number and PCI bus numbers
+
+# If the first VM NIC has a bridge (likely), assign it and verify it's host NIC
+# Abort if nic0_bridge is set but bridge0_nic is NOT set
+
+if [ ! -z $nic0_bridge ]; then
+	nic_bridge=$nic0_bridge
+	eval nic_bridge_host_nic=\$${nic_bridge}_nic
+	[ -z $nic_bridge_host_nic ] && \
+{ f_error "Host bridge NIC not set. Skipping NIC $nic_count" ; return 1 ; }
+fi
+
+[ ! -z $nic0_type ] && nic_type=$nic0_type
+# [ ! -z $nic0_mac ] && nic_mac=$nic0_mac
+# [ ! -z $nic0_description ] && nic_description=$nic0_description
+
+while [ ! -z $nic_type ]; do # No NIC, break immediately, else until exhausted
+
+	[ "$nic_type" = "tap" -o "$nic_type" = "vmnet" ] || \
+		{ f_error "nic_type not set. Skipping" ; return 1 ; }
+	nic_dev=$nic_type$nic_prefix$two_digit_vmid$nic_count
+
+	if [ ! -z $nic_bridge ]; then # Allow for no bridge: bridge and nic_dev
+
+# BEGIN SCRIPT GENERATION of ifconfig commands
+
+# Steps
+# 2. Is the bridge UP? up if not
+# 3. Does the bridge contain the NIC specified in vmrc.conf?
+# 4. Does the bridge contain this VM NIC device?
+
+# NB! Test with and without the trailing "up". Any stalls?
+# How do we echo in tabs?
+
+cat >> $bootscript <<-EOF
+	ifconfig $nic_bridge >/dev/null 2>&1 || \\
+	ifconfig $nic_bridge create up >/dev/null 2>&1 || \\
+	{ logger "$nic_bridge create failed. Skipping $vmname" ; return 1 ; }
+
+	ifconfig $nic_bridge | grep -qw "UP,BROADCAST" || \\
+	ifconfig $nic_bridge up >/dev/null 2>&1 || \\
+	{ logger "$nic_bridge failed to up. Skipping $vmname" ; return 1 ; }
+
+	ifconfig $nic_bridge | grep -qw "member: $nic_bridge_host_nic" || \\
+	ifconfig $nic_bridge addm $nic_bridge_host_nic >/dev/null 2>&1
+
+ifconfig $nic_bridge | grep -qw "member: $nic_dev"
+if [ \$? = "0" ]; then
+	ifconfig $nic_dev | grep -qw "UP,BROADCAST" || \\
+	ifconfig $nic_dev up >/dev/null 2>&1 || \\
+	{ logger "$nic_dev failed to up. Skipping $vmname" ; return 1 ; }
+else
+	ifconfig $nic_dev create up >/dev/null 2>&1
+	ifconfig $nic_bridge addm $nic_dev >/dev/null 2>&1 || \\
+	{ logger "$nic_dev failed to up. Skipping $vmname" ; return 1 ; }
+fi # Does nic_bridge contain nic_dev
+
+EOF
+
+	else # nic_dev only
+
+cat >> $bootscript <<-EOF
+
+if [ \$( ifconfig $nic_dev >/dev/null 2>&1 ); then
+	ifconfig $nic_dev | grep -qw "UP,BROADCAST" || \\
+	ifconfig $nic_dev up >/dev/null 2>&1 || \\
+	{ logger "$nic_dev failed to up. Skipping $vmname" ; return 1 ; }
+
+else
+
+	ifconfig $nic_dev create up >/dev/null 2>&1 || \\
+	{ logger "$nic_dev failed create. Skipping $vmname" ; return 1 ; }
+
+fi
+EOF
+
+	fi # -z $nic_bridge
+
+# Null out variables, increment counter and break if no more NICs
+
+	nic_bridge=""
+	nic_type=""
+#	nic_mac=""
+# 	nic_description=""
+	nic_bridge_host_nic=""
+	nic_count=$((nic_count+1)) # Increment $nic_count
+	[ $nic_count = "8" ] && { nic_prefix=$((nic_prefix+1)) ; nic_count=0 ; }
+	[ $nic_prefix = "10" ] && break
+	eval nic_type=\"\$nic${nic_count}_type\"
+	eval nic_bridge=\"\$nic${nic_count}_bridge\"
+	eval nic_bridge_host_nic=\$${nic_bridge}_nic
+# 	eval nic_mac=\"\$nic${nic_count}_mac\"
+# 	eval nic_description=\"\$nic${nic_count}_description\"
+
+done
+
+# Begin vmrun.sh-style while loop, disabled for install_mode: exit on reboot
+
+			if [ ! "$install_mode" = "YES" ]; then
+				echo "while [ 1 ]; do" >> $bootscript
+			fi
+
+	echo "	[ -e /dev/vmm/$vmname ] && \\" >> $bootscript
+	echo "		/usr/sbin/bhyvectl --vm=$vmname --destroy" \
+				>> $bootscript
+	echo "" >> $bootscript
+
+	case $bhyve_loader in
+		bhyveload)
+
+		if [ "$install_mode" = "YES" -o "$livecd_mode" = "YES" ]; then
+			[ -z $install_method ] && \
+		{ f_error "install_method is not set. Skipping" ; return 1 ; }
+echo "	/usr/sbin/bhyveload -m $vm_ram -d \
+	$host_vmdir/$vmname/install.$install_method $vmname"  >> $bootscript
+		else # End install_mode
+			case $disk0_type in
+				dev)
+
+echo "	/usr/sbin/bhyveload -m $vm_ram -d $disk0_device $vmname" \
+>> $bootscript
+				;;
 				img)
-	echo
-	echo Checking for $host_vmdir/$1/${1}.img and initializing vm_device
-	if [ -f $host_vmdir/$1/${1}.img ]; then
-		 vm_device=$host_vmdir/$1/${1}.img
-	else
-		echo Device could not be found. Skipping ; return 1
-	fi
+echo "	/usr/sbin/bhyveload -m $vm_ram -d $host_vmdir/$vmname/disk0.img $vmname" >> $bootscript
 				;;
 				zvol)
-	echo
-	echo Checking for /dev/zvol/${host_zpool}/$1 and initializing vm_device
-	if [ -e /dev/zvol/${host_zpool}/$1 ]; then
-		vm_device=/dev/zvol/$host_zpool/$1
-	else
-		echo zvol could not be found. Skipping ; return 1
-	fi
-		;;
-		*)
-		echo Device could not be found. Skipping ; return 1
-		esac
+echo "	/usr/sbin/bhyveload -m $vm_ram -d /dev/zvol/$host_zpool$host_vmdir$vmname/disk0 $vmname" >> $bootscript
+			esac #disk_type
+		fi # End if install_mode or livecd_mode
 
-	local console_flags=""
-	case $vm_console in
-		nmdm) console_flags="-s 5,lpc -l com1,/dev/nmdm${vm_id}A"
-		;;
-		*) console_flags="-s 5,lpc -l com1,stdio"
-	esac
+		;; # End case bhyveload
+		uefi-csm|uefi-gop) true # Nothing to do here
+		;; # End case uefi-csm or uefi-gop
+		grub-bhyve)
 
-	local iso_flags=""
-# NOTE that $iso_boot is set to "isobootyes" by vm_iso().
-	[ "$iso_boot" = "isobootyes" ] &&
-		iso_flags="-s 4,ahci-cd,$host_vmdir/$1/$1.iso"
+		if [ "$install_mode" = "YES" -o "$livecd_mode" = "YES" ]; then
+			[ -z $install_method ] && \
+		{ f_error "install_method is not set. Skipping" ; return 1 ; }
+echo -e "$iso_grub_cfg" > $host_vmdir/$vmname/grub.cfg
 
-	local device_flags=""
-	if [ -n "$vm_devices" ]; then
-		echo "Additional devices requested: $vm_devices"
-#		device_flags=""
-		dev_count=0
-		for device in $vm_devices; do
-			if [ ! -e ${device} ]; then
-				echo "$device not found. Skipping..."
-			else
-device_flags="$device_flags -s 6:${dev_count},${virtio_type},${device}"
-		dev_count=$((dev_count+1))
-			fi
-		done
-	fi
-
-# MULTIPLE NIC ACROBATICS:
-# Example:
-# vm3 has a default NIC 0 of tap8030 NIC on PCI 3:0, tap8031 is NIC 1 on PCI 3:1
-# WHY 8 you might ask? ifconfig can't take "tap020" so we use "tap8020".
-# 8 represents infinity... The middle digits represent the VM ID in the tap dev
-
-echo
-echo Starting VM Networking
-local tap_prefix=8 # Keep in sync with the local in f_stop
-local tap_base_id=$vm_id
-local tap_id="$(printf "%02i" "$tap_base_id")" # vm2 "2" -> 02 for tap8020
-
-local tap_unit=0 #Additional vtnet PCI device and tap device suffix
-
-# Initialize the first VM NIC
-
-local nic_flags=""
-echo
-echo Verifying if tap$tap_prefix$tap_id$tap_unit already exists
-if [ ! "$( ifconfig | grep tap$tap_prefix$tap_id$tap_unit )" ]; then
-	echo
-	echo Running ifconfig tap$tap_prefix$tap_id$tap_unit create
-	echo ifconfig tap$tap_prefix$tap_id$tap_unit create > \
-		$host_vmdir/$1/ifconfig_cmd.sh
-	ifconfig tap$tap_prefix$tap_id$tap_unit create
-fi
-nic_flags="-s 3:${tap_unit},virtio-net,tap$tap_prefix$tap_id$tap_unit"
-
-echo
-echo Running ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up
-
-echo ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up >> \
-	$host_vmdir/$1/ifconfig_cmd.sh
-ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up
-
-# Check for additional requested VM NICs and create
-	if [ ${vm_addtl_nics:-0} -gt 0 ]; then # if gt "" or "0" additional nics
-		echo
-		echo "$vm_addtl_nics additional virtual NICs requested"
-		while [ $tap_unit -lt $vm_addtl_nics ]; do # start at unit 0
-			tap_unit=$((tap_unit+1)) # increment it
-
-nic_flags="$nic_flags -s 3:${tap_unit},virtio-net,tap$tap_prefix$tap_id$tap_unit"
-# Informational info or echo commands are not working here because of the loop?
-echo
-echo Running ifconfig tap$tap_prefix$tap_id$tap_unit create
-		echo ifconfig tap$tap_prefix$tap_id$tap_unit create >> \
-				$host_vmdir/$1/ifconfig_cmd.sh
-		ifconfig tap$tap_prefix$tap_id$tap_unit create
-#echo
-#echo Running ifconfig tap$tap_prefix$tap_id$tap_unit up
-#				ifconfig tap$tap_prefix$tap_id$tap_unit up 
-echo
-echo Running ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up
-echo ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up >> \
-	$host_vmdir/$1/ifconfig_cmd.sh
-ifconfig bridge$host_bridge addm tap$tap_prefix$tap_id$tap_unit up
-		done
-	fi
-
-# Experimental and dangerous considering that a we are root:
-# Run a preflight script to set up devices, bridges etc.
-	echo
-	echo Checking for preflight script $host_vmdir/$1/preflight_cmd.sh
-	if [ -f $host_vmdir/$1/preflight_cmd.sh ]; then
-		echo Running $host_vmdir/$1/preflight_cmd.sh script
-		sh $host_vmdir/$1/preflight_cmd.sh
-		echo Done running $host_vmdir/$1/preflight_cmd.sh script
-		echo
-	fi
-
-# Hypothetical usage of the preflight script:
-# 1. Create malloc devices for use as the boot or additional devices
-# 2. Create an additional bridge and reassign the tapXXXX devices to it
-
-# FIX: NO indenting for attractive bhyve command output?
-# FIX: Any way to remove double spaces?
-
-# THE ACTUAL BHYVE COMMAND #
-
-local bhyve_cmd="/usr/sbin/bhyve \
--c "$vm_cpus" \
--m "$vm_ram" -A -H \
-"$bhyve_flags" \
--s "0,${vm_hostbridge}hostbridge" \
--s "2,$virtio_type,$vm_device" \
-"$nic_flags" \
-"$iso_flags" \
-"$console_flags" \
-"$device_flags" \
-"$1"
-"
-
-# Was -s "3,virtio-net,tap$vm_id" \ before multiple NIC syntax
-# Note that ps -ww is your friend when debugging tmux command execution
-
-	echo
-	echo Running the bhyve command with $vm_console console:
-	echo $bhyve_cmd
-	echo $bhyve_cmd > $host_vmdir/$1/bhyve_cmd.sh
-	echo "service vm onestop $1" > $host_vmdir/$1/stop_cmd.sh
-
-	local timestamp=$( f_timestamp )
-	echo $timestamp $bhyve_cmd >> $host_vmdir/$1/${1}.log
-
-	case $vm_console in
-	stdio)
-		eval "$bhyve_cmd"
-		f_stop $1
-		f_mddestroy $1
-		;;
-	nmdm)
-		echo Verifying if nmdm.ko is loaded and load if necessary
-		kldstat | grep -qw nmdm.ko || \
-		{ echo nmdm.ko not loaded. Loading ; \
-		kldload nmdm.ko ;} || \
-		{ echo nmdm.ko failed to load. Skipping ; return 1 ;}
-
-		echo
-		echo Booting $1 on console /dev/nmdm%uA
-
-( trap "f_stop $1" EXIT; eval "$bhyve_cmd" ) &
-
-# Alternatives to try:
-#		eval $bhyve_cmd &
-#		echo $bhyve_cmd > $host_vmdir/$1/${1}.log
-#		eval $bhyve_cmd > /dev/null 2>&1 # Or direct to a logfile
-		;;
-	tmux)
-		echo
-		echo Remember to stop $1 after shutdown
-		echo
-#		/usr/local/bin/tmux new -s $1 "eval $bhyve_cmd"
-
-# Note that TERM needs to be set because grub-bhyve, tmux and screen use ncurses
-		export TERM=xterm
-		tmux_cmd="/usr/local/bin/tmux new -s "$1" 'eval $bhyve_cmd'"
-		echo $tmux_cmd > $host_vmdir/$1/${1}.log
-		echo $tmux_cmd > $host_vmdir/$1/tmux_cmd.sh
-		echo
-		echo Running the tmuxed bhyve command:
-		echo $tmux_cmd
-eval $tmux_cmd
-		;;
-	tmux-detached)
-### It is tricky to destroy the VM after shutdown when attached to tmux ###
-		/usr/local/bin/tmux new -d -s "$1" "eval $bhyve_cmd ; bhyvectl --destroy --vm=$1"
-
-#		tmux_cmd="/usr/local/bin/tmux new -d -s "$1" 'eval $bhyve_cmd ; bhyvectl --destroy --vm=$1\'"
-#			echo Running the tmuxed bhyve command:
-#				echo $tmux_cmd
-#				eval $tmux_cmd
-
-		echo
-		echo Remember to stop $1 after shutdown
-		echo
-		echo Attach to $1 with: tmux attach-session -t $1
-		echo
-		echo HINT: Ctrl-b d to detach from it
-		;;
-	screen)
-		echo
-		echo Running #/usr/local/bin/screen -S $1 eval $bhyve_cmd
-# FIX: These may need TERM to be set for ncurses use
-		/usr/local/bin/screen -S $1 eval $bhyve_cmd
-		;;
-	screen-detached)
-		echo
-				echo Running #/usr/local/bin/screen -d -S $1 eval $bhyve_cmd
-		/usr/local/bin/screen -d -S $1 eval $bhyve_cmd
-		;;
-		*)
-		echo
-				echo VM console not defined. Exiting 
-				exit 1
-
-	esac
-} # end f_boot
-
-f_stop() # $host_vmdir $vm_name ($1)
-{
-# Blindly clean up, given how much can be left: /dev/vmm's, tap's, md's
-#	echo
-#	echo Verifying if $1 is already loaded
-#		[ -e /dev/vmm/$1 ] || \
-#		{ echo $1 is not loaded. Skipping ; return 1 ;}
-
-#	vm_id="${1#${1%[0-9]*}}"
-	vm_id=${1##*[!0-9]}
-
-	echo
-	echo Sending ACPI shutdown to $1
-	/bin/pkill -9 -f $1
-	echo
-	echo Destroying $1 with bhyvectl
-	/usr/sbin/bhyvectl --destroy --vm=$1 > /dev/null 2>&1
-
-	echo
-	echo Destroying tap network devices
-	# It appears they are removed from the bridge upon destruction
-		local tap_prefix=8 # Keep in sync with the local in f_boot
-		local tap_count=0
-		local tap_base_id=$tap_id
-		tap_base_id="$( printf "%02i" $vm_id)"
-
-		while [ $tap_count -lt 9 ]; do
-#		echo Checking for tap$tap_prefix${tap_base_id}$tap_count
-			ifconfig | grep -qw tap$tap_prefix${tap_base_id}$tap_count && \
-				{ echo Destroying tap$tap_prefix${tap_base_id}$tap_count ; \
-		ifconfig tap$tap_prefix${tap_base_id}$tap_count destroy ; }
-				tap_count=$((tap_count+1))
-		done
-
-		[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-		[ $vm_os_type ] || \
-{ echo $host_vmdir/$1/${1}.conf failed to source. Skipping ; return 1 ; }
-
-	case $vm_console in
-	stdio)
-		return 1
-		;;
-	nmdm)
-# FIX: this does not result in a prompt. Requires <ENTER>. Not an easy fix.
-		echo
-		echo Terminating any $1 cu processes. Press ENTER
-	ps axopid,ucomm,command | awk -v ucomm=cu -v find=nmdm${vm_id}B '
-		$1 == ucomm {
-			pid = $1
-			sub("^[" FS "]*[^" FS "]+", "")
-			sub("^[" FS "]*[^" FS "]+", "")
-			sub("^[" FS "]*[^" FS "]+", "")
-			if ( $0 ~ find ) print pid
-			}' | xargs kill
-		;;
-	tmux|tmux-detached) # FIX: was tmux* Wildcard works?
-		/usr/local/bin/tmux list-sessions | grep -qw "$1 " || \
-			echo Session $1 is not running!
-		echo
-		echo Terminating the $1 tmux session
-		/usr/local/bin/tmux kill-session -t $1
-		;;
-	screen|screen-detached)
-		echo
-		echo Terminating the $1 screen session
-		/usr/local/bin/screen -X -S $1 quit
-		;;
-	*)
-		return 1
-	esac
-} # end f_stop
-
-f_attach() # $host_vmdir $vm_name ($1)
-{
-#	vm_id="${1#${1%[0-9]*}}"
-	vm_id=${1##*[!0-9]}
-
-echo
-echo Verifying if $1 is loaded
-	[ -e /dev/vmm/$1 ] || \
-	{ echo $1 is not loaded. Exiting ; exit 1 ;}
-
-echo
-echo Reading the $host_vmdir/$1/${1}.conf config file
-	[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-	[ $vm_os_type ] || \
-{ echo $host_vmdir/$1/${1}.conf failed to source. Skipping ; return 1 ; }
-
-	case $vm_console in
-	stdio)
-		echo
-		echo The VM console should be visible on stdio
-		;;
-	nmdm)
-		[ -e "/dev/nmdm${vm_id}B" ] || \
-		{ echo nmdm device not found. Exiting ; exit 1 ; }
-		echo
-		echo Remember you can detach with \" \~ CTRL-d \"
-		/usr/bin/cu -l "/dev/nmdm${vm_id}B" -s 9600
-		;;
-	tmux|tmux-detached)
-# FIX: Check here if the session in fact exists?
-		echo
-		echo Remember you can detach with \" CTRL-b d \"
-		/usr/local/bin/tmux attach-session -t $1
-		;;
-	screen|screen-detached)
-		echo
-		echo Remember you can detach with \" C-a DD \"
-		/usr/local/bin/screen -d -r $1
-		;;
-	*)
-		echo VM console not defined. Exiting
-		exit 1
-	esac
-} # end f_attach
-
-f_grub() # $vm_names ($1)
-{
-		echo
-		echo Using grub-bhyve and checking if installed
-		[ -x /usr/local/sbin/grub-bhyve ] || \
-{ echo "grub-bhyve missing \(ports/sysutils/grub2-bhyve\)" ; return 1 ; }
-
-	echo
-	echo Verifying if vmm.ko is loaded and loading if necessary
-		kldstat | grep -qw vmm.ko || \
-		{ echo vmm.ko not loaded. Loading ; \
-		kldload vmm ; } || \
-		{ echo vmm.ko failed to load. Exiting ; exit 1 ; }
-
-	echo
-	echo Verifying if $1 is already loaded
-		[ -e /dev/vmm/$1 ] && \
-{ echo Destroying $1 ; /usr/sbin/bhyvectl --destroy --vm=$1 > /dev/null 2>&1 ;}
-
-	echo
-	echo Reading the $host_vmdir/$1/${1}.conf config file
-		[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-		[ $vm_os_type ] || \
-{ echo $host_vmdir/$1/${1}.conf failed to source. Skipping ; return 1 ; }
-
-case $vm_dev_type in # device and malloc are already set
-		device) echo prefixing $vm_device from the VM config file with /dev
-				$vm_device=$vm_device/dev
+			case $install_method in
+				iso) local install_dev="(cd0)"
 				;;
-		malloc) echo prefixing $vm_device from the VM config file with /dev
-				$vm_device=$vm_device/dev
+				img) local install_dev="(hd0)"
+			esac
+
+echo "$install_dev $host_vmdir/$vmname/install.$install_method" \
+	> $host_vmdir/$vmname/device.map
+
+# Note that "-r" and "-d" are assumed to exist in the VM configuraiton file
+echo "/usr/local/sbin/grub-bhyve $iso_grub_r $iso_grub_d -m $host_vmdir/$vmname/device.map -M $vm_ram $vmname" >> $bootscript
+		else # End install_mode
+			case $disk0_type in
+				dev)
+echo -e "$img_grub_cfg" > $host_vmdir/$vmname/grub.cfg
+echo "(hd0) $disk0_device" > $host_vmdir/$vmname/device.map
 				;;
-		img) vm_device=$host_vmdir/$1/${1}.img ;;
-		zvol) vm_device=/dev/zvol/${host_zpool}/$1 ;;
-		*) echo vm_dev_type was not set. Exiting ; exit 1
-esac
-
-	echo
-	echo Creating $host_vmdir/$1/device.map
-		echo "(hd0) $vm_device" > $host_vmdir/$1/device.map || \
-	{ echo device.map generation failed ; return 1 ; }
-	[ -f $host_vmdir/$1/${1}.iso ] &&
-	{ echo "(cd0) $host_vmdir/$1/${1}.iso" >> $host_vmdir/$1/device.map ; }
-
-	echo
-	echo Using the device.map:
-		cat $host_vmdir/$1/device.map
-
-# Note that we are specifically not using the grub.cfg
-
-	echo
-#	echo Creating an empty $host_vmdir/$1/grub.cfg
-#	echo "" > $host_vmdir/$1/grub.cfg
-	echo Removing $host_vmdir/$1/grub.cfg
-	rm $host_vmdir/$1/grub.cfg
-#	touch $host_vmdir/$1/grub.cfg
-
-# Note that we are specifically not using -d or -r
-
-grub_cmd="/usr/local/sbin/grub-bhyve -m $host_vmdir/$1/device.map -M $vm_ram $1"
-
-		echo $timestamp $grub_cmd >> $host_vmdir/$1/${1}.log
-
-		echo
-		echo Running the grub-bhyve command:
-	echo $grub_cmd
-	echo
-	echo $grub_cmd > $host_vmdir/$1/grub_cmd.sh
-		echo "service vm onestop $1" > $host_vmdir/$1/stop_cmd.sh
-
-# Note that TERM needs to be set because grub-bhyve, tmux and screen use ncurses
-	export TERM=xterm
-	eval $grub_cmd
-
-[ -e /dev/vmm/$1 ] || echo VM $1 failed to load
-[ -e /dev/vmm/$1 ] && echo VM $1 appears to have loaded successfully
-} # end f_grub
-
-f_mount() # $vm_names ($1) (a single FreeBSD VM)
-{
-
-echo
-echo Reading the $host_vmdir/$1/${1}.conf config file
-		[ -f $host_vmdir/$1/${1}.conf ] && . $host_vmdir/$1/${1}.conf
-		[ $vm_os_type ] || \
-{ echo $host_vmdir/$1/${1}.conf failed to source. Skipping ; return 1 ; }
-
-	[ "$vm_os_type" = "freebsd" ] || \
-	{ echo Only supported by FreeBSD VMs. Exiting ; exit 1 ; }
-
-echo
-echo Verifying if VM is already loaded
-	[ -e /dev/vmm/$1 ] && { echo $1 already loaded. Exiting ; exit 1 ; }
-
-echo
-echo Verifying if VM is already mounted on its mount point
-		( mount | grep -qw $1/mnt ) && \
-		{ echo $1 is mounted. Exiting ; exit 1 ; }
-
-# FIX: umount first? force? (see previous logic)
-# FIX: medestroy it first?
-
-case $vm_dev_type in # device and malloc are already set
-		device) echo prefixing $vm_device from the VM config file with /dev
-				$vm_device=$vm_device/dev
-				;;
-		malloc) echo prefixing $vm_device from the VM config file with /dev
-				$vm_device=$vm_device/dev
-				;;
-		img) vm_device=$host_vmdir/$1/${1}.img ;;
-		zvol) vm_device=/dev/zvol/${host_zpool}/$1 ;;
-		*) echo vm_dev_type was not set. Exiting ; exit 1
-esac
-
-echo
-echo Checking for $host_vmdir/$1/mnt and creating if necessary
-		if [ ! -d "$host_vmdir/$1/mnt" ]; then
-						echo Creating $host_vmdir/$1/mnt
-				mkdir -p $host_vmdir/$1/mnt || \
-		{ echo $1/mnt could not be created. Exiting ; exit 1 ; }
-		fi
-
-if [ "$vm_dev_fs" = "ufs" ]; then
-				case $vm_dev_type in
 				img)
-						[ -e $vm_device ] || \
-						{ echo $vm_device is missing. Skipping ; return 1 ; }
-						echo 
-						echo Detaching any previous memory device attachments
-						f_mddestroy $1
-						echo Attempting to attach $vm_device
-						dev_to_fsck=$( mdconfig -af $vm_device )
-						[ -c /dev/$dev_to_fsck ] ||
-		{ echo $vm_device did not attach. Skipping ; return 1 ; }
-
-						echo Running fsck
-						fsck_ufs -y $dev_to_fsck$vm_dev_root
-
-			echo Running mount
-			mount /dev/$dev_to_fsck$vm_dev_root $host_vmdir/$1/mnt
-			if [ ! $( mount | grep -qw $1/mnt ) ]; then
-# FIX: this test seems inverted - fixed by space after mnt ? )
-				echo $1 is mounted on $host_vmdir/$1/mnt
-			else
-				echo $1 failed to mount
-			fi
+echo -e "$img_grub_cfg" > $host_vmdir/$vmname/grub.cfg
+# NB! Need to handle empty grub.cfg files
+# Presumably they have -r and -d values to override that scenario
+echo "(hd0) $host_vmdir/$vmname/disk0.img" \
+	> $host_vmdir/$vmname/device.map
 				;;
-				zvol|device|malloc)
-						echo
-						echo Verifying that $vm_device exists
-						[ -e $vm_device ] || \
-						{ echo $vm_device is missing. Skipping ; return 1 ; }
-						echo Running fsck
-						fsck_ufs -y $vm_device$vm_dev_root
+				zvol)
+echo "(hd0) /dev/zvol/$host_zpool$host_vmdir$vmname/disk0" \
+	> $host_vmdir/$vmname/device.map
+			esac # disk_type
 
-			echo Running mount
-						mount $vm_device$vm_dev_root $host_vmdir/$1/mnt
-						if [ ! $( mount | grep -qw $1/mnt) ]; then
-# FIX: Is this test working inverted?
-								echo $1 is mounted on $host_vmdir/$1/mnt
-						else
-								echo $1 failed to mount
-						fi
-		esac
-elif [ "$vm_dev_fs" = "zfs" ]; then
+[ "$grub_mode" = "YES" ] && { img_grub_d="" ; img_grub_r="" ; } # Null for GRUB
 
-	[ $vm_dev_type = "img" ] && mdconfig -af $vm_device
-	# All other "real" defices should be found by the zpool import command
+# Note that -r and -d are assumed to exist in the VM configuraiton file
+echo "/usr/local/sbin/grub-bhyve $img_grub_r $img_grub_d -m $host_vmdir/$vmname/device.map -M $vm_ram $vmname" >> $bootscript
+		fi # End if install_mode or livecd_mode
 
-	zpool import -f -o altroot=/$host_vmdir/$1/mnt ${1}pool || \
-	{ echo $1pool did not import. Skipping ; f_mddestroy $1 ; return 1 ; }
-else
-	echo vm_dev_fs is not properly initialized in the configuration file
+		;; # End case grub-bhyve
+		*) f_error "bhyve_loader is not set. Skipping" ; return 1
+		;;
+	esac # End case $bhyve_loader
+
+# END BHYVE|GRUB LOAD STEPS, BEGIN BHYVE BOOT STEPS
+
+# THE RULES TO IMPLEMENT
+
+# -H Don't peg at 100% CPU. Everyone wants that.
+# -P Exit if a pause instruction is detected (Only if oversubscribing)
+# -A Generage ACPI table, needed by FreeBSD but UEFI handles it! Either OR!
+# -p CPU pinning. Add as an extra flag
+# -w MSR safety. Needed by some OSs on some high end Intel architectures
+
+# We are sending serial output to com1,stdio for external handling by attach
+
+# NB! Consider if this really should be its own flag
+# If ACPI tables are requested for FreeBSD but we're NOT loading with UEFI...
+#acpi_flag=""
+#[ "$bhyve_loader" = "uefi-NB!" ] || [ "$bhyve_acpi_tables" = "YES" ] && \
+#	acpi_flag="-A"
+
+echo "logger Booting $vmname" >> $bootscript
+echo "	/usr/sbin/bhyve -c $vm_cpus -m $vm_ram -H $acpi_flag $bhyve_flags \\" \
+	>> $bootscript
+
+case $bhyve_hostbridge in
+	AMD|amd) echo "	-s 0,amd_hostbridge \\" >> $bootscript
+	;;
+	NONE|none) true
+	;;
+	*) echo "	-s 0,hostbridge \\" >> $bootscript
+esac # case $bhyve_hostbridge
+
+# NB! Should the counters be local variables?
+
+# PCI SLOT NUMBERING RULES:
+# pci bus/slot/function
+# 0-31/0-7/0-255 NetBSD and Windows requires bus 0, UEFI: 3,4,5 and 6 for AHCI
+
+# NOT SEEING THE 3/4/5/6 LIMITATION ON UEFI-GOP WITH WINDOWS 2016!
+# WHY DOES WINDOWS SHOW DVD FAILED TO BOOT WITH NO CD DEVICE?
+
+# Slot 0: Hostbridge
+# Slot 1: Free for now
+# Slot 3: UEFI: Install Media, iso or img during install
+# Slot 3: UEFI: Boot disk
+# Slot 3: bhyveload/grub-bhyve: Boot disk
+# Slot 4: UEFI: Boot disk during install (WILL THIS SHIFT BITE ANYONE?)
+# Slot 5:0~7 Additional Disk NB! Might one not want a boot disk? PXE?
+# Slot 6: Future: Additional Disk
+# Slot 7: Future: Additional Disks for non-legacy load-up
+
+# Add other ahci/virtio-blk parameters! block size! Etc.!
+# Slot 8:0~7 NICs
+# Slot 9:0~7 More NICs... for a total of 16
+# Future: PCI passthrough (Future, remember to wire VM memory)
+# Slot 29/30: UEFI Framebuffer and precise mouse
+# Slot 31 lpc A hard requirement for UEFI
+
+# Note that we validated all disks in the "prep" step
+
+disk0bus="3" # Default to disk0 on bus 3, loader hands install image
+
+if [ "$install_mode" = "YES" -o "$livecd_mode" = "YES" ]; then
+# No... seems we need ISOs for most installations and can't rely on the loaders
+# If install mode AND uefi-csm OR uefi-gop... (cleaner way?)
+#	case $bhyve_loader in
+#		uefi-csm|uefi-gop)
+
+# DROP TO bus 2 BECAUSE IT SEEMS TO BE WORKING ON WINDOWS 2016?
+# NB! We are relying on install method to be iso or img here... check!
+# ADD THAT install method validation!
+
+	case $install_method in
+		iso) ahci_type="cd"
+		;;
+		img) ahci_type="hd"
+	esac
+
+echo "	-s 3,ahci-$ahci_type,$host_vmdir/$vmname/install.$install_method \\" \
+	>> $bootscript
+disk0bus="4" # And put disk0 on bus 4
+#	esac # uefi-csm|uefi-gop
 fi
 
-echo
-echo Verifying if VM mounted on its mount point
-		( mount | grep -qw $1/mnt ) || \
-		{ echo $1 did not mount. Exiting ; exit 1 ; }
-echo
-echo $1 appears to have mounted
-} # end f_mount
-
-f_umount() # $vm_names ($1)
-{
-echo
-echo Verifying if $1 is loaded
-		[ -e /dev/vmm/$1 ] && \
-		{ echo $1 is loaded. Exiting ; exit 1 ; }
-
-echo
-echo Verifying if $1 is already mounted on $host_vmdir$1/mnt
-		mount | grep -qw $1/mnt || \
-		{ f_mddestroy $1 ; echo $1 is not mounted. Exiting ; exit 1 ; }
-
-echo
-echo Unmounting $host_vmdir/$1/mnt/dev in case it was jailed
-	umount -f $host_vmdir/$1/mnt/dev
-
-[ -f $host_vmdir/$vm_names/${vm_names}.conf ] && \
-	. $host_vmdir/$vm_names/${vm_names}.conf
-[ $vm_os_type ] || \
-{ echo $host_vmdir/$vm_names/${vm_names}.conf failed to source. ; exit 1 ;} 
-
-case $vm_dev_fs in
-	ufs)
-		echo
-		echo Unmounting $host_vmdir/$1/mnt/
-		umount -f $host_vmdir/$1/mnt/
+# NB! FreeBSD UFS "img" install fails to boot after install, presumably because
+# ada1 is now named ada0 and the fstab is wrong
+case $disk0_type in
+	dev)
+echo "	-s $disk0bus,$disk0_virtio,$disk0device \\" >> $bootscript
 	;;
-	zfs)
-		echo
-		echo Exporting ${1}pool
-		zpool export ${1}pool
-esac
-
-	if [ "$vm_dev_type" = "img" ]; then
-		echo
-		echo Detaching memory device
-		f_mddestroy $1
-	fi
-mount | grep -qw $1/mnt || \
-		{ f_mddestroy $1 ; echo $1 appears to have unmounted; }
-} # end f_umount
-
-################################################## LOOPING TOP FUNCTIONS
-
-vm_start() # $vm_count $host_vmdir $vm_names
-{
-	# Put your global preflight steps here:
-	# /etc/rc.d/pf stop # stop packet filtering on PC-BSD
-
-	case $vm_count in
-	0) echo ; echo Starting all VMs in $host_vmdir
-		local num_found
-		for vm_found in "$host_vmdir"/*; do
-			vm_name="${vm_found##*/}"
-			num_found=1
-
-				echo
-			echo Verifying if $vm_names is already loaded
-				[ -e /dev/vmm/$vm_names ] && \
-				{ echo $vm_names is already loaded. Skipping ; return 1 ;}
-			echo Starting $vm_name
-
-			f_load $vm_name && f_boot $vm_name
-# FIX: f_boot is still called if you quit out of the loader. workaround?
-		done
-		[ $num_found ] || \
-		{ echo No VMs found. Exiting ; exit 1 ; }
+	img)
+echo "	-s $disk0bus,$disk0_virtio,$host_vmdir/$vmname/disk0.img \\" \
+	>> $bootscript
 	;;
-	1) echo ; echo Starting $vm_names
-						echo
-						echo Verifying if $vm_names is already loaded
-						[ -e /dev/vmm/$vm_names ] && \
-		{ echo $vm_names is already loaded. Skipping ; return 1 ;}
-			f_load $vm_names && f_boot $vm_names
-	;;
-	*) echo ; echo Starting VMs $vm_names
-		for vm_name in $vm_names; do
-						echo
-						echo Verifying if $vm_names is already loaded
-						[ -e /dev/vmm/$vm_names ] && \
-		{ echo $vm_names is already loaded. Skipping ; return 1 ;}
+	zvol)
+echo "	-s $disk0bus,$disk0_virtio,/dev/zvol/$host_zpool$host_vmdir$vmname/disk0 \\" \
+	>> $bootscript
+esac #disk0_type
 
-			echo
-			echo Starting $vm_name
-			f_load $vm_name && f_boot $vm_name
-		done
+# disk0 and optional UEFI install media are handled. On to additional disks
+# NB! MORE BUILD-UP in that block or PASS A FLAG FOR THE NEXT STEP?
+# Build from 5 if UEFI/install_mode, build from 4 otherwise... $disk0bus?
+# Do we want to support more disks during installation for RaidZ etc.?
+
+# LOOP THROUGH ADDITIONAL DISKS
+# NB! Decide which to start at and IF we overload "functions" for lots on
+# non-legacy interrupt systems
+
+if [ "$disk1_type" ]; then # If one additional disk is set, loop for more
+
+	disk_prefix=5
+	disk_id=1 # Moving to the next user-specified disk
+	disk_count=0 # Counter for disk device number and PCI bus numbers
+	disk_virtio=""
+	disk_type="$disk1_type"
+	disk_device=""
+
+while [ $disk_type ]; do # While a valid disk_(type) exists while incrementing
+
+# NB! Can this be simplified to initialize disk_*_type to the current disk?
+eval disk_virtio=\"\$disk${disk_id}_virtio\"
+[ -z $disk_virtio ] && \
+	{ f_error "disk${disk_id}_virtio is not set. Skipping" ; return 1 ; }
+
+	case $disk_type in
+		dev)
+		eval disk_device=\"\$disk${disk_id}_device\"
+		[ -z $disk_device ] && \
+	{ f_error "disk${disk_id}_device is not set. Skipping" ; return 1 ; }
+# NB! Think about the best return
+echo "	-s $disk_prefix:$disk_count,$disk_virtio,$disk_device \\" >> $bootscript
+f_info "You probably want sysctl kern.geom.debugflags=16 to do this"
+		;;
+		img)
+echo "	-s $disk_prefix:$disk_count,$disk_virtio,$host_vmdir/$vmname/disk${disk_id}.img \\" \
+	>> $bootscript
+		;;
+		zvol)
+echo "	-s $disk_prefix:$disk_count,$disk_virtio,/dev/zvol/$host_zpool$host_vmdir$vmname/disk${disk_id} \\" \
+	>> $bootscript
 	esac
-} # end vm_start
 
-vm_stop() # $vm_names $vm_count
-{
-	case $vm_count in
-	0) echo ; echo Stopping all VMs in $host_vmdir
-		local num_found
-		for vm_found in "$host_vmdir"/*; do
-			vm_name="${vm_found##*/}"
-			num_found=1
-		if [ ! -e /dev/vmm/$vm_name ]; then
-			echo $vm_name is not loaded. Skipping
-		else
-			echo
-			echo Stopping $vm_name
-			f_stop $vm_name
-			f_mddestroy $vm_name
-		fi
-		done
-		[ $num_found ] || \
-		{ echo No VMs Found. Exiting ; exit 1 ; }
-	;;
-	1) echo ; echo Stopping $vm_names
-			f_stop $vm_names
-			f_mddestroy $vm_names
-	;;
-	*) echo ; echo Stopping VMs $vm_names
-		for vm_name in $vm_names; do
-			f_stop $vm_name
-			f_mddestroy $vm_name
-		done
+	disk_id=$((disk_id+1)) # Increment $disk_id
+	disk_count=$((disk_count+1)) # Increment $disk_count
+	[ $disk_count = "8" ] && { disk_prefix=6 ; disk_count=0 ; }
+	[ $nic_prefix = "7" ] && { logger "Disk Maximum Reached" ; break ; }
+	eval disk_type=\"\$disk${disk_id}_type\"
+
+[ -z $disk_type ] && break
+
+# Updated disk_id and disk_type are passed into the while loop
+
+done # This should exit when disk(${disk})_type is undefined/does not exist
+
+fi
+
+# Simplified NIC ifconfig loop consdering that we have verified all variables
+
+	nic_prefix=8 # Reset as before
+	nic_count=0 # Counter for NIC device number and PCI bus numbers
+	[ -z $nic0_type ] || local nic_type=$nic0_type # Reset as before
+	# [ -z $nic0_mac ] || local nic_mac=$nic0_mac
+	# [ -z $nic0_description ] || local nic_description=$nic0_description
+
+while [ ! -z $nic_type ]; do # No NIC, break immediately, else until exhausted
+	nic_dev=$nic_type$nic_prefix$two_digit_vmid$nic_count
+
+echo "	-s $nic_prefix:$nic_count,virtio-net,$nic_dev \\" >> $bootscript
+
+	nic_type=""
+#	nic_mac=""
+#	nic_description=""
+	nic_count=$((nic_count+1)) # Increment $nic_count
+	[ $nic_count = "8" ] && { nic_prefix=$((nic_prefix+1)) ; nic_count=0 ; }
+	[ $nic_prefix = "10" ] && break
+	eval nic_type=\"\$nic${nic_count}_type\"
+#	eval nic_mac=\"\$nic${nic_count}_mac\"
+#	eval nic_description=\"\$nic${nic_count}_description\"
+
+done
+
+# Remaining UEFI parameters
+
+case $bhyve_loader in
+	uefi-csm|uefi-gop)
+		[ -z $uefi_bootrom ] && \
+	{ f_error "bootrom $uefi_bootrom not set. Skipping" ; return 1 ; }
+		[ -r $uefi_bootrom ] || \
+	{ f_error "bootrom $uefi_bootrom not found. Skipping" ; return 1 ; }
+echo "	-l bootrom,$uefi_bootrom \\" >> $bootscript
+
+	case $bhyve_loader in
+		uefi-gop)
+			[ -z $uefi_fb_width ] && \
+		{ f_error "uefi_fb_width not set. Skipping" ; return 1 ; }
+			[ -z $uefi_fb_height ] && \
+		{ f_error "uefi_fb_height not set. Skipping" ; return 1 ; }
+
+		vnc_wait_for_connection=""
+		[ "$install_mode" = "YES" ] && vnc_wait_for_connection=",wait"
+# NB! We are recklessly using ports 59** but not too many things will collide
+echo "	-s 29,fbuf,tcp=0.0.0.0:59$vmid,w=${uefi_fb_width},h=${uefi_fb_height}$vnc_wait_for_connection \\" >> $bootscript
+#NB! Consider sending the VNC port information to the logger
 	esac
-} # end vm_stop
 
-vm_restart()
-{
-	case $vm_count in
-	0) echo ; echo Restarting all VMs in $host_vmdir
-		local num_found
-		for vm_found in "$host_vmdir"/*; do
-			[ -d $host_vmdir/$vm_name ] || continue # FIX: why?
-			vm_name="${vm_found##*/}"
-			num_found=1
-		if [ ! -f $host_vmdir/$vm_name/${vm_name}.conf ]; then
-			echo $vm_name: no configuration file found: Skipping
-		else
-			f_stop $vm_name
-			f_mddestroy $vm_name
-			f_load $vm_name
-			f_boot $vm_name
-		fi
-		done
-		[ $num_found ] || \
-		{ echo No VMs found. Exiting ; exit 1 ; }
-	;;
-	1) echo ; echo Restarting $vm_names
-		if [ ! -f $host_vmdir/$vm_names/${vm_names}.conf ]; then
-			echo $vm_names: no configuration file found: Skipping
-			exit 1
-		else
-			echo
-			echo Restarting $vm_names
-			f_stop $vm_names
-			f_mddestroy $vm_names
-			f_load $vm_names
-			f_boot $vm_names
-		fi
-	;;
-	*) echo ; echo Starting VMs $vm_names
-		for vm_name in $vm_names; do
-		if [ ! -f "$host_vmdir/$vm_name/${vm_name}.conf" ]; then
-			echo $vm_name: no configuration file found: Skipping
-			fi
-			echo
-			echo Restarting $vm_name
-			f_stop $vm_name
-			f_load $vm_name
-			f_boot $vm_name
-		done
+# NB! May want to check that uefi-gop is set
+	case $uefi_tablet in
+		YES)
+echo "	-s 30,xhci,tablet \\" >> $bootscript
 	esac
-} # end vm_restart
 
-vm_status() # $vm_names
-{
-	case $vm_count in
-	0)
-		if [ ! -d /dev/vmm/ ]; then
-			echo
-			echo No VMs running. Exiting
-			exit 1
-		else
-			echo
-			echo Listing loaded VMs
-			ls /dev/vmm/*
-		fi
+esac # End UEFI Parameters
+
+# lpc on slot 31 is a hard requirement for UEFI
+echo "	-s 31,lpc -l com1,stdio \\" >> $bootscript
+
+# Complete the bhyve command
+echo "	$vmname" >> $bootscript
+
+# Complete the vmrun.sh style loop
+if [ ! "$install_mode" = "YES" ]; then
+	echo "		if [ \$? -ne 0 ]; then" >> $bootscript
+	echo "			break" >> $bootscript
+	echo "		fi" >> $bootscript
+	echo "logger Rebooting $vmname" >> $bootscript
+	echo "done" >> $bootscript
+fi # End vmrun.sh-sytle while loop. Perform cleanup on exit
+
+echo "	/usr/sbin/bhyvectl --vm=$vmname --destroy" >> $bootscript
+
+# NB! ZERO networking clean up at this time given that we could have 16 NICs
+
+		;; # End case vm_container = bhyve
+
+		jail) f_error "Not yet implemented" ; exit 1
+# NB! First reimplement mount/umount, then jail, then 9p/diskless bhyve
+#echo "/usr/sbin/jail -c path=${host_vmdir}/$vmname/mnt/ mount.devfs ip4.addr=$vm_ipv4 command=/bin/sh" >> $bootscript
+		;; # End case jail
+
+		qemu)
+
+# NB! Implement qemu install mode
+
+echo "#!/bin/sh" > $bootscript
+echo "# Autogenerated by vmrc /usr/local/etc/rc.d/vm" >> $bootscript
+echo "/usr/local/bin/qemu-system-x86_64 -m $vm_ram -localtime \\" \
+	>> $bootscript
+# NB! Set the boot disk
+echo "-drive file=$host_vmdir$vmname/disk0.img,format=raw \\" >> $bootscript
+
+case $qemu_console in
+	text)
+		echo "-curses" >> $bootscript
 	;;
-	1)
-		if [ -e /dev/vmm/$vm_names ]; then
-			echo
-			echo $vm_names is loaded
-		else
-			echo
-			echo $vm_names is not loaded
-		fi
+	vnc|VNC)
+		echo "-vnc :$vmid -usbdevice tablet" >> $bootscript
 	;;
 	*)
-		for vm_name in $vm_names; do
-			if [ -e /dev/vmm/$vm_name ]; then
-				echo
-				echo $vm_name is loaded	
-			else
-				echo
-				echo $vm_names is not loaded.	
-			fi
-		done
-	esac
-} # end vm_status
+		f_error "qemu_console is not set. Skipping" ; return 1 ;
+esac
 
-############################################## NON-LOOPING TOP FUNCTIONS
+		;; # End case qemu
 
-vm_load() # $vm_names
-{
-	case $vm_count in # Initialized in MAIN based on rc directives
-	0) echo ; echo Please specify a single VM by name
-				exit 1
-	;;
-	1) echo ; echo Loading $vm_names # One VM
-		f_load $vm_names
-	;;
-	*) echo ; echo Please specify a single VM by name
-				exit 1
-	esac
-} # end vm_load
+		vbox) f_error "Not yet implemented" ; exit 1
+		;; # End case vbox
 
-vm_boot() # $vm_count $host_vmdir $vm_names
-{
+		xen)
 
-		case $vm_count in
-		0) echo ; echo Please specify a single VM by name
-				exit 1
-		;;
-		1) echo ; echo Booting $vm_names # One VM
-				f_boot $vm_names
-		;;
-		*) echo ; echo Please specify a single VM by name
-				exit 1
+	xen_cfg="$host_vmdir/$vmname/xen.cfg"
 
-		esac
+	echo "builder = \"hvm\"" > $xen_cfg
+	echo "memory = $vm_ram" >> $xen_cfg
+	echo "vcpus = $vm_cpus" >> $xen_cfg
+	echo "name = \"$vmname\"" >> $xen_cfg
 
-} # end vm_boot
+# NB! Note iso vs. img install_mode methods. Assume iso only for now
 
-vm_attach()
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo Attaching to $vm_names
-		f_attach $vm_names
-	;;
-	*) echo ; echo Please specify a single VM by name
-		exit 1
-	esac
-} # end vm_attach
-
-vm_debug() # Display debugging information
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo Displaying debug information for $vm_names
-		vm_name=$vm_names
-		[ -e /dev/vmm/$vm_name ] ||
-		echo $vm_name is not loaded.
-		/usr/sbin/bhyvectl --get-all --vm=$vm_name
-	;;
-	*) echo ; echo Please specify a single VM by name
-		exit 1
-	esac
-} # end vm_debug
-
-vm_mount() # $vm_names ($1)
-{
-		case $vm_count in
-		0) echo ; echo Please specify a single VM by name
-				exit 1
-		;;
-		1) echo ; echo Attempting to mount $host_vmdir/$vm_names/mnt 
-				f_mount $vm_names
-		;;
-		*) echo ; echo Please specify a single VM by name
-				exit 1
-		esac
-} # end vm_mount
-
-vm_umount() # $vm_names ($1)
-{
-		case $vm_count in
-		0) echo ; echo Please specify a single VM by name
-				exit 1
-		;;
-		1) echo ; echo Unmounting $host_vmdir/$vm_names/mnt
-				f_umount $vm_names
-		;;
-		*) echo ; echo Please specify a single VM by name
-				exit 1
-		esac
-} # end vm_umount
-
-vm_iso() # $vm_names ($1)
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo booting the ISO for VM $vm_names
-		iso_boot="isobootyes" # inform f_boot() to use the VM's ISO
-		f_load $vm_names && f_boot $vm_names
-	;;
-	*) echo ; echo Please specify a single VM by name
-		exit 1
-	esac
-} # end vm_iso
-
-vm_grub() # $vm_names ($1)
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo Loading the ISO for VM $vm_names with grub-bhyve
-		f_grub $vm_names
-	;;
-	*) echo ; echo Please specify a single VM by name
-		exit 1
-	esac
-} # end vm_grub
-
-vm_jail() # $vm_names ($1)
-{
-		case $vm_count in
-		0) echo ; echo Please specify a single VM by name
-				exit 1
-		;;
-		1) echo ; echo Booting VM $vm_names as a jail
-				f_mount $vm_names
-		ls $host_vmdir/$vm_names/mnt
-	echo
-	echo Reading the $host_vmdir/$vm_names/${vm_names}.conf config file
-		[ -f $host_vmdir/$vm_names/${vm_names}.conf ] && . $host_vmdir/$vm_names/${vm_names}.conf
-		[ $vm_os_type ] || \
-		{ echo $host_vmdir/$vm_names/${vm_names}.conf failed to source. Exiting ; exit 1 ; }
-		echo
-				echo flags like \"sendmail_enable\", \"inetd_flags\" and
-				echo \"rpcbind_enable\" are not configured by mkvm.sh
-# FIX: Note that mount.devfs requires a full path and may fail (is it correct?)
-
-		local jail_cmd="/usr/sbin/jail \
-		-c path=${host_vmdir}/$vm_names/mnt/ mount.devfs \
-		ip4.addr=$vm_ipv4 command=/bin/sh
-				" # END-QUOTE
-
-		echo
-		echo Running the jail command:
-		echo $jail_cmd
-
-				local timestamp=$( f_timestamp )
-			echo $timestamp $jail_cmd >> $host_vmdir/$vm_names/${vm_names}.log
-				eval $jail_cmd
-				f_umount $vm_names
-		;;
-		*) echo ; echo Please specify a single VM by name
-				exit 1
-		esac
-} # end vm_jail
-
-vm_qemu() # $vm_names ($1)
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo Booting VM $vm_names under qemu
-
-# FIX: Why is this test inverted?
-		type qemu-system-x86_64 > /dev/null 2>&1 &&
-		{ echo qemu is not installed! ports/emulators/qemu Exiting. ; exit 1 ; }
-
-	echo
-	echo Verifying if $vm_names is already loaded
-		[ -e /dev/vmm/$vm_names ] && \
-		{ echo $vm_names is already loaded. Skipping ; return 1 ;}
-
-	echo
-	echo Verifying if $vm_names is already mounted on $host_vmdir$vm_names/mnt
-		mount | grep -qw $vm_names/mnt && \
-		{ echo $vm_names is mounted. Skipping ; return 1 ; }
-
-	echo
-		echo Reading the $host_vmdir/$vm_names/${vm_names}.conf config file
-		[ -f $host_vmdir/$vm_names/${vm_names}.conf ] && . $host_vmdir/$vm_names/${vm_names}.conf
-		[ $vm_os_type ] || \
-	{ echo $host_vmdir/$vm_names/${vm_names}.conf failed to source. Exiting ; exit 1 ; }
-
-#	vm_id="${vm_names#${1%[0-9]*}}"
-	vm_id=${1##*[!0-9]}
-
-	/usr/local/bin/qemu-system-x86_64 -localtime -boot once=d -cdrom \
-	$host_vmdir/$vm_names/${vm_names}.iso \
-	$host_vmdir/$vm_names/${vm_names}.img \
-	-m $vm_ram -vnc :$vm_id -usbdevice tablet &
-
-	echo
-	echo $vm_names should be available via VNC on \"localhost:\"
-	echo
-	;;
-
-	*) echo ; echo Please specify a single VM by name
-		exit 1
-	esac
-} # end vm_qemu
-
-vm_delete()
-{
-	case $vm_count in
-	0) echo ; echo Please specify a single VM by name
-		exit 1
-	;;
-	1) echo ; echo Deleting $vm_names
-		if [ -e /dev/vmm/$vm_names ]; then
-			echo $vm_names is loaded. Skipping
-			return 1
-		elif [ ! -e $host_vmdir/$vm_names ]; then
-			echo $vm_names does not exist. Skipping
-			return 1
+# NB! Verify disks, implement multiple disk acrobatics
+		if [ "$install_mode" = "YES" -o "$livecd_mode" = "YES" ]; then
+	echo "disk = [ '$host_vmdir$vmname/disk0.img,raw,hda,w', " >> \
+		$xen_cfg
+	echo "'$host_vmdir$vmname/install.iso,raw,hdc:cdrom,r' ]" >> \
+		$xen_cfg
+	echo "boot = \"d\"" >> $xen_cfg
 		else
-			echo Unmounting $host_vmdir/$vm_names/mnt if necessary
-			mount | grep -qw $vm_names/mnt && \
-					umount -f $host_vmdir/$vm_names/mnt
-			echo Removing $host_vmdir/$vm_names immutable file flags
-			chflags -R noschg $host_vmdir/$vm_names
-			echo Running rm -rf $host_vmdir/$vm_names
-			rm -rf $host_vmdir/$vm_names
-			[ -e /dev/zvol/${host_zpool}/$vm_names ] && \
-			{ echo Destroying zvol $host_zpool/$vm_names ; \
-			zfs destroy $host_zpool/$vm_names ; }
-		fi
+	echo "disk = [ '$host_vmdir$vmname/disk0.img,raw,hda,w' ]" >> \
+		$xen_cfg
+	echo "boot = \"c\"" >> $xen_cfg
+		fi # End install_mode or livecd_mode
+
+	echo "vif = [ 'bridge=bridge0' ]" >> $xen_cfg
+
+case $xen_console in
+	text)
+		echo "vga = \"none\"" >> $xen_cfg
 	;;
-	*) echo ; echo Please specify a single VM by name
-				exit 1
+	vnc|VNC)
+		echo "vnc = 1" >> $xen_cfg
+		echo "vncdisplay = $vmid" >> $xen_cfg
+		echo "vnclisten = \"$vnc_ip\"" >> $xen_cfg
+		echo "usbdevice = \"tablet\"" >> $xen_cfg
+	;;
+	*)
+		f_error "xen_console is not set. Skipping" ; return 1 ;
+esac
+
+	echo "serial = \"pty\"" >> $xen_cfg
+	echo "on_poweroff = \"destroy\"" >> $xen_cfg
+	echo "on_reboot = \"restart\"" >> $xen_cfg
+	echo "on_crash = \"restart\"" >> $xen_cfg
+	echo "acpi = 1" >> $xen_cfg
+
+		echo "#!/bin/sh" > $bootscript
+		echo "# Autogenerated by vmrc /usr/local/etc/rc.d/vm" \
+			>> $bootscript
+
+cat >> $bootscript <<-EOF
+kldstat | grep -qw "if_tap.ko" || kldload if_tap.ko || \\
+{ logger "if_tap.ko did not load. Skipping $vmname" ; return 1 ; }
+
+ifconfig $nic0_bridge >/dev/null 2>&1 || \\
+ifconfig $nic0_bridge create up >/dev/null 2>&1 || \\
+{ logger "$nic0_bridge create failed. Skipping $vmname" ; return 1 ; }
+
+ifconfig $nic0_bridge | grep -qw "member: $bridge0_nic" || \\
+ifconfig $nic0_bridge addm $bridge0_nic SYNCDHCP >/dev/null 2>&1 || \\
+{ logger "$nic0_bridge addm $bridge0_nic failed. Skipping $vmname" ; return 1 ; }
+
+ifconfig $nic0_bridge | grep -qw "UP,BROADCAST" || \\
+ifconfig $nic0_bridge up >/dev/null 2>&1 || \\
+{ logger "$nic0_bridge failed to up. Skipping $vmname" ; return 1 ; }
+
+EOF
+
+			case $xen_console in
+				text)
+				echo "xl create -c $xen_cfg" >> $bootscript
+				;;
+				vnc|VNC)
+				echo "xl create $xen_cfg" >> $bootscript
+				;;
+				*)
+			f_error "xen_console is not set. Skipping" ; return 1 ;
+			esac
+		;; # End case xen
 	esac
-	
-} # end vm_delete
+} # End f_vm_prep
 
-############################################################ MAIN SOURCE
+f_vm_boot() # $vmname # Executes VM boot scripts and thus desired console
+{
 
-# exec 3>&1 # Duplicate stdout to file descriptor 3; used by info()
+# NB! If this is ALWAYS called after f_vm_prep, then all variables will
+# remain set. If there is any question, re-set them/read config etc.
+	vmname="$1"
+#	vmid=${1##*[!0-9]}
+
+[ "$dryrun" = "YES" ] && { f_info "Dry run for vm $vmname" ; return 0 ; }
+	# Exit here if a dry run
+
+# First come, first serve hypervisor check. Consider tracking identified ones.
+# NB! Consider setting a flag to simplify the check for subsequent VMs
+	case $vm_container in
+		xen)
+			[ -d /dev/xen ] || \
+		{ f_error "Xen kernel not loaded. Skipping" ; return 1 ; }
+		;; # End case xen
+		bhyve)
+			[ -d /dev/xen ] && \
+		{ f_error "Xen kernel is loaded. Skipping" ; return 1 ; }
+#			kldstat | grep -qw "vboxdrv.ko" && \
+#		{ f_error "VirtualBox is loaded. Skipping" ; return 1 ; }
+# Verify that we're checking the right VBox module kqemu.ko?
+#			kldstat | grep -qw "vmm.ko" || \
+#		{ f_info "Loading the bhyve kernel module" ; kldload vmm ; }
+		;; # End case bhyve
+		qemu)
+			[ -x /usr/local/bin/qemu-system-x86_64 ] || \
+		{ f_error "QEMU is not installed. Skipping" ; return 1 ; }
+		;; # End case qemu
+	esac # case verify ability to run xen or bhyve
+
+	f_info "Booting $vmname"
+
+# This is a place you could put additional network initialization
+
+	case $vm_console in
+		nmdm)
+			f_error "nmdm is not yet implemented"
+		;; # End case nmdm
+		tmux)
+			f_info "Booting $vmname in a tmux session"
+/usr/local/bin/tmux new -d -s $vmname "/bin/sh $host_vmdir$vmname/$vm_container.sh"
+		;; # End case tmux
+		screen)
+			f_info "Booting $vmname in a screen session"
+/usr/local/bin/screen -dmS $vmname /bin/sh $host_vmdir$vmname/$vm_container.sh
+		;; # End case screen
+		dtach)
+			f_error "dtach is not yet implemented"
+		;; # End case dtach
+		*) f_error "vm_console is not set. Skipping" ; return 1 ;
+	esac
+
+} # End f_vm_boot
+
+f_start_exit() # Uses global $vmcount # Conditional exit for f_start
+{
+	case $vmcount in
+		0) continue
+		;;
+		1) exit 1
+		;;
+		*) exit 1
+		;;
+	esac
+} # End f_start_exit
+
+f_start() # $vmname # Called in a loop for all VMs or for one VM
+{
+# NB! All overrides are aliased to "start|onestart" and must be handled here
+# Problem: We want to continue on error for all VMs and exit if one VM
+# f_start_exit handles the code BUT, all say "Skipping" though may be exiting
+
+	vmname="$1"
+	vmid=${vmname##*[!0-9]} # Remove name, leaving VM ID
+
+	[ -z $vmid ] && { f_error "$vmname is not numbered. Skipping" ; \
+		f_start_exit ; }
+
+	f_info "Checking if $vmname is already started"
+	f_check_vm_started $vmname && \
+	{ f_error "VM $vmname is already started. Skipping" ; f_start_exit ; }
+
+# Reminder: We have only used $vmname and $vmid so far
+
+	f_info "Reading config file for $vmname"
+# Clear all variables by reading the master template. Exit on error
+	f_readconf ${host_templates}/master_template || \
+{ f_error "${host_templates}/master_template failed to parse. Exiting" ; \
+	exit 1 ; }
+
+# Read the VM config file. Continue on error
+	f_readconf $host_vmdir${vmname}/vm.conf || \
+	{ f_error "vm.conf failed to parse. Skipping" ; f_start_exit ; }
+
+# Re-read the vmrc.conf file in case VM attempted to override it. Exit on error
+# Note that vmrc.conf was sourced when the script first executed
+
+	f_readconf /usr/local/etc/vmrc.conf || \
+{ f_error "/usr/local/etc/vmrc.conf failed to parse. Exiting" ; exit 1 ; }
+
+	if [ $vmcount = "0" ]; then # Check "start all"
+		[ "$vm_autoboot" = "YES" -o "$vm_autoboot" = "yes" ] || \
+{ f_error "$vmname \"vm_autoboot\" is disabled. Skipping" ; f_start_exit ; }
+	fi
+
+	f_info "Preparing $vmname"
+
+# NB! TEST REQUIRED VARIABLES Note that most are validated later
+
+[ -z $vm_cpus ] && { f_error "vm_cpus is not set. Skipping" ; return 1 ; }
+	[ "$vm_cpus" -gt 0 ] || \
+		{ f_error "vm_cpus is not a valid number" ; return 1 ; }
+
+	[ -z $vm_ram ] && { f_error "vm_ram is not set. Skipping" ; return 1 ; }
+
+	[ "$vm_ram" -gt 0 ] || \
+		{ f_error "vm_ram is not a valid number" ; return 1 ; }
+[ -z $vm_console ] && { f_error "vm_console is not set. Skipping" ; return 1 ; }
+	[ -z $vm_container ] && \
+		{ f_error "vm_container is not set. Skipping" ; return 1 ; }
+
+# Check disk0_type because we will use disk_type for the loop
+[ -z $disk0_type ] && { f_error "disk0_type is not set. Skipping" ; return 1 ; }
+
+disk_id="0" # Start with disk0. Increment until out of disks
+
+eval disk_type=\"\$disk${disk_id}_type\"
+
+[ -z $disk_type ] && \
+	{ f_error "disk${disk_id}_type is not set. Skipping" ; return 1 ; }
+
+while [ $disk_type ]; do
+	eval disk_virtio=\"\$disk${disk_id}_virtio\"
+	[ -z $disk_virtio ] && \
+	{ f_error "disk${disk_id}_virtio is not set. Skipping" ; return 1 ; }
+
+	case $disk_type in
+		dev)
+		eval disk_device=\"\$disk${disk_id}_device\"
+			[ -z $disk_device ] && \
+	{ f_error "disk${disk_id}_device is not set. Skipping" ; return 1 ; }
+		;;
+		img)
+			[ -r $host_vmdir/$vmname/disk${disk_id}.img ] || \
+{ f_error "$host_vmdir/$vmname/disk${disk_id}.img is missing. Skipping" ; \
+	return 1 ; }
+		;;
+		zvol)
+	[ -c /dev/zvol/$host_zpool$host_vmdir$vmname/disk${disk_id} ] || \
+{ f_error "/dev/zvol/$host_zpool$host_vmdir$vmname/disk${disk_id} is missing. \
+	Skipping" ; return 1 ; }
+	esac
+
+	disk_virtio=""
+	disk_device=""
+	disk_id=$((disk_id+1)) # Increment $disk_id
+	eval disk_type=\"\$disk${disk_id}_type\"
+	[ -z $disk_type ] && break # break if next disk_id type is not set
+done # $disk_type while loop
+
+disk_type=""
+
+# SET RUNTIME OVERRIDES to pass into f_vm_prep and f_vm_boot
+# NB! sync_these
+	dryrun=""
+	dryboot=""
+	grub_mode=""
+	install_mode=""
+	livecd_mode=""
+
+	case $vm_livecd in
+		YES|yes)
+			livecd_mode="YES"
+		;;
+	esac
+
+	case $vm_rc_command in # Only one override is possible at a time
+		dryrun|onedryrun) dryrun="YES"
+		;;
+		dryruninstall|onedryruninstall)
+			dryrun="YES"
+			install_mode="YES"
+		;;
+		dryrunlivecd|onedryrunlivecd)
+			dryrun="YES"
+			livecd_mode="YES"
+		;;
+		dryboot|onedryboot) dryboot="YES"
+		;;
+		grub|onegrub) grub_mode="YES"
+		;;
+		install|oneinstall) install_mode="YES"
+		;;
+		livecd|onelivecd) livecd_mode="YES"
+		;;
+		bhyve|onebhyve) vm_container="bhyve"
+		;;
+		bhyveinstall|onebhyveinstall)
+			vm_container="bhyve"
+			install_mode="YES"
+		;;
+#		jail|onejail) vm_container="jail"
+#		;;
+		qemu|oneqemu) vm_container="qemu"
+		;;
+#		vbox|onevbox) vm_container="vbox"
+#		;;
+		xen|onexen) vm_container="xen"
+		;;
+	xeninstall|onexeninstall) vm_container="xen" ; install_mode="YES"
+		;;
+	esac
+
+	# Call the function that prepares the configuration files and scripts
+	f_vm_prep $vmname
+		# "dryboot" will simply return 0 for f_vm_prep under
+		# the assumption that all prepartion is done and customized
+		# Consider moving that to here
+
+	f_info "Starting $vmname Virtual Machine under $vm_container"
+
+	# Call the function that calls the scripts with the console of choice
+# NB! Should dryboot abort here?
+	f_vm_boot $vmname
+
+# NB! VEIRFY THAT f_vm_prep and f_vm_boot VALIDATE WHAT WE DID NOT CHECK HERE
+
+} # End f_start
+
+f_stop() # $vmname # Called in a loop for all VMs or for one VM
+{
+	vmname="$1"
+	vmid=${vmname##*[!0-9]} # Remove name, leaving VM ID
+
+	[ -z $vmid ] && { f_error "$vmname is not numbered. Skipping" ; \
+		f_start_exit ; }
+
+# NB! We must rely on vmname because of the ability to override the container
+# We don't know what container is is running under or what condition it is in
+# Cleaning up all related networking would be quite the challenge
+
+	if [ -d /dev/vmm ]; then
+
+		vm_pid=$( ps axwww | grep -v grep | \
+		grep "bhyve: $vmname (bhyve)" | \
+		awk '{ print $1 }' )
+
+		if [ ! $vm_pid = "" ]; then
+
+			f_info "Sending ACPI shutdown to $vmname"
+			f_info "Termininating bhyve PID $vm_pid"
+			kill -s TERM $vm_pid
+#			kill -15 $vm_pid
+# NB! kill -s SIGTERM does not report as being supported and pgrep doesn't grep
+
+			f_info "Sleeping 10 seconds for ACPI shutdown"
+			sleep 5
+# NB! Experiment with this, get feedback from the wilderness
+
+			f_info "Sending ACPI poweroff to $vmname"
+			/usr/sbin/bhyvectl --force-poweroff --vm=$vmname
+
+		fi # No bhyve process running for the VM, continue the teardown
+
+		f_info "Destroying $vmname with bhyvectl"
+		/usr/sbin/bhyvectl --destroy --vm=$vmname >/dev/null 2>&1
+
+		f_info "Destroying tap$vmid"
+		ifconfig tap$vmid destroy >/dev/null 2>&1
+# NB! Sweep for more tap devices when multiple NIC support is restored
+
+	elif [ -d /dev/xen ]; then
+
+		f_info "Stopping $vmname with xl shutdown"
+		/usr/local/sbin/xl shutdown $vmname
+# NB! Perhaps sleep and check for shutdown. Destroy if not gone
+		f_info "Destroying $vmname with xl destroy" ; \
+		/usr/local/sbin/xl destroy $vmname
+	else
+
+# NB! What emulators have intelligent destroys? Note jail commands
+
+#	f_info "Displaying processes for $vmname for the user to handle"
+#	ps axwww | grep -v grep | grep $vmname
+
+	fi
+} # End f_stop
+
+f_attach() # $vmname # Attach to a VM text console
+{
+	vmname="$1"
+	f_readconf $host_vmdir${vmname}/vm.conf
+
+	case $vm_console in
+		nmdm)
+			f_error "nmdm is not yet implmented"
+#			vmid=${1##*[!0-9]}
+#			[ -e "/dev/nmdm${vmid}B" ] || \
+#			{ f_info "nmdm device not found. Exiting" ; exit 1 ; }
+#			f_error "Detach: \" \~ CTRL-d \""
+#			/usr/bin/cu -l "/dev/nmdm${vmid}B" -s 9600
+		;; # End case nmdm
+		tmux)
+# NB! This check will fail if stuck in grub!
+#			[ -f /dev/vmm/$vmname ] || \
+#				{ f_error "$vmname is not running" ; exit 1 ; }
+			f_info "Detach: \" CTRL-b d \""
+			export TERM=xterm
+			/usr/local/bin/tmux attach-session -t $vmname
+		;; # End case tmux
+		screen)
+			f_info "Detach: \" C-a DD \""
+			export TERM=xterm
+			/usr/local/bin/screen -d -r $vmname
+		;;
+		dtach)
+			f_error "dtach is not yet implemented"
+		;; # End case dtach
+		*) f_error "vm_console is not set. Skipping"
+			return 1
+		;; # End case screen
+	esac
+} # End f_attach
+
+# NB! Consider a loop to keep attempting to attach
+f_vnc() # $vmname # Attach to a VM Xconsole
+{
+	vmname="$1"
+	vmid=${1##*[!0-9]}
+
+	f_readconf $host_vmdir${vmname}/vm.conf
+
+#	case $vm_xconsole in
+#		vnc)
+			export DISPLAY=':0.0'
+			/usr/local/bin/xhost +local:root
+			export XAUTHORITY=~/.Xauthority
+
+			case $vm_container in
+				bhyve)
+		sleep 2
+		/usr/local/bin/vncviewer $vnc_ip:59$vmid >/dev/null 2>&1 &
+				;;
+				xen|qemu)
+		/usr/local/bin/vncviewer $vnc_ip:$vmid >/dev/null 2>&1 &
+			esac
+#		;; # End case vnc
+#		rdp)
+#			f_error "Not yet implemented"
+#xfreerdp /v:$vm_ip /u:Administrator /p:Test123
+#		;; # End case rdp
+#		*) f_error "vm_xconsole is not set"
+#	esac
+} # End f_vnc
+
+f_mount()
+{
+	f_error "Not yet implemented"
+} # End f_mount
+######################################################### END SUPPORT FUNCTIONS
+
+############################## LOOPING RC ARGUMENT FUNCTIONS (start, stop etc.)
+# (Operate on all VMs if none specified, or a single VM)
+
+# NB! sync_these
+vm_start() # $vmlist and uses globals $vmcount $host_vmdir
+{
+# NB! VMs start alphabetically, not by VM ID. Zero specified = All VMs
+
+# NB! This is confusing in dryrun mode
+#	echo "Starting vm."
+
+	case $vmcount in
+	0)
+		# Exit if an override is requested. Same behavior as f_limit_one_vm
+		case $vm_rc_command in
+# NB! sync_these directives for one VM at a time
+attach|oneattach|vnc|onevnc|dryrun|onedryrun|dryruninstall|onedryruninstall|dryboot|onedryboot|install|oneinstall|livecd|onelivecd|dryrunlivecd|onedryrunlivecd|grub|onegrub|bhyve|onebhyve|bhyveinstall|onebhyveinstall|qemu|oneqemu|xen|onexen|xeninstall|onexeninstall)
+			f_error "Please specify a single VM by name. Exiting"
+			exit 1
+		esac
+
+		f_info "Starting all VMs in $host_vmdir"
+		if [ $( ls $host_vmdir | wc -l ) = 0 ]; then
+			f_error "No VMs found. Exiting"
+			exit 1
+		fi
+
+		f_info "Checking for conflicting VM IDs"
+		f_check_vmid_conflicts
+
+		for vmfound in ${host_vmdir}/* ; do
+# NB!			vmid="" # Unset just in case
+			vmname="${vmfound##*/}" # Remove path, leaving VM name
+			f_start $vmname
+		done
+	;;
+	1) f_info "Starting $vmlist" # List of one name provided
+		f_start $vmlist
+	;;
+	*) f_info "Specify a single VM by name or none to start all VMs"
+		exit 1
+	esac
+
+} # End vm_start
+
+vm_stop() # $vmlist
+{
+	case $vmcount in
+		0) f_info "Stopping all VMs in $host_vmdir"
+			for vmfound in ${host_vmdir}/* ; do
+				vmname="${vmfound##*/}"
+				f_stop $vmname
+			done
+		;;
+		1) f_info "Stopping $vmlist" # One name provided
+			f_stop $vmlist
+		;;
+		*) f_info "Specify a single VM by name or none to stop all VMs"
+			exit 1
+	esac
+} # End vm_stop
+
+vm_restart() # Behavior TBD
+{
+# standard rc argument unless it automatically calls stop and start
+	f_error "Restart not yet implemented"
+} # End vm_restart
+
+vm_status() # Behavior TBD: bhyve and Xen: List VMs, jls, qemu?
+{
+	# check for bhyve VMs
+	if [ -d /dev/vmm ]; then
+		echo -n "Loaded bhyve VMs:  "
+		for VM in /dev/vmm/*; do
+			echo -n "$(basename ${VM}) "
+		done
+		echo ""
+	else
+		echo "No bhyve VMs running."
+	fi
+
+	# check for xen vms
+	if [ -d /dev/xen ]; then
+		echo "NB! Add a Xen list here!"
+	#else
+	#	echo "No Xen VMs running."
+	fi
+# NB! Something for the other containers!
+} # End vm_status
+
+vm_list() # List VMs in $vmdir
+{
+	[ -d $host_vmdir ] && echo "Available VMs:" ; ls $host_vmdir
+} # End vm_list
+
+
+############################################ NON-LOOPING RC ARGUEMENT FUNCTIONS
+
+# NB! sync_these
+
+vm_attach() # $vmlist # Attach to a VM text console
+{
+	f_limit_one_vm $vmcount
+	f_info "Attaching to $vmlist"
+	f_attach $vmlist
+} # End vm_attach
+
+vm_vnc() # $vmlist # Attach to a VM Xconsole
+{
+	f_limit_one_vm $vmcount
+	f_info "Attaching to $vmlist"
+	f_vnc $vmlist
+} # End vm_vnc
+
+#vm_debug() # Behavior TBD for all containers: Display debugging information
+#{
+#	f_limit_one_vm $vmcount
+## NB! Check if bhyve, if not, skip, or expand to all HVs
+#	f_info "Displaying debug information for $vmlist"
+#		[ -e /dev/vmm/$vmlist ] ||
+#			f_error "$vmlist is not loaded"
+#		/usr/sbin/bhyvectl --get-all --vm=$vmlist
+#} # End vm_debug
+
+#vm_mount() # $vmlist ($1)
+#{
+#	f_limit_one_vm $vmcount
+#	f_check_vm_started $vmlist
+#	info "Verifying if $vmlist boot device is already mounted on $host_vmdir$vmnames/mnt"
+#		mount | grep -qw "$vmlist/mnt" && \
+#		{ f_error "$vmlist is mounted. Skipping" ; return 1 ; }
+#	f_info "Attempting to mount $host_vmdir/$vmlist/mnt"
+#	f_mount $vmlist
+#} # End vm_mount
+
+#vm_umount() # $vmlist ($1)
+#{
+#	f_limit_one_vm $vmcount
+#	f_info "Unmounting $host_vmdir/$vmlist/mnt"
+#	f_umount $vmlist
+#} # End vm_umount
+
+################################################################# END FUNCTIONS
+
+################################################################ MAIN OPERATION
+
+# NB! Would this be appropriate for an rc script when manually run?
+suid=$( id -u )
+
+[ "$suid" = "0" ] || \
+	{ echo "Must be excuted with root privileges. Exiting" ; exit 1 ; }
 
 # Preserving $1, $* and $# in meaningful ways
-vm_cmd="$1" # the rc directive, "start", "stop" etc.
+
+vm_rc_command="$1"
 [ $# -gt 0 ] && shift 1 # strip off the rc command, leaving string of VMs
-vm_names="$*" # all VM to act on (preserve $*) DO NOT RE-INITIALIZE
-vm_count="$#" # number of vm's passed in (preserve $#) DO NOT RE-INITIALIZE
+vmlist="$*" # all VM to act on (preserve $*) DO NOT RE-INITIALIZE
+vmcount="$#" # number of vm's passed in (preserve $#) DO NOT RE-INITIALIZE
 
-iso_boot="" # Used by f_boot and vm_iso
+# Manually sourcing vmrc.conf because it contains the f_info|error settings
+# See f_readconf
+# NB! Echo or log that we are running (info|error_method is not set yet)
+# Consider validating that each directory path entry starts and ends with "/"
+# so we can have $host_vmdir$vmname/ rather than $host_vmdir/$vmname/
 
-echo
-echo Reading /usr/local/etc/vm.conf
-		[ -f /usr/local/etc/vm.conf ] && . /usr/local/etc/vm.conf
-		[ $host_vmdir ] || \
-		{ echo /usr/local/etc/vm.conf failed to source. Exiting ; exit 1 ; }
+[ -f /usr/local/etc/vmrc.conf ] || \
+	{ echo /usr/local/etc/vmrc.conf does not exist. Exiting ; exit 1 ; }
+[ -r /usr/local/etc/vmrc.conf ] || \
+	{ echo /usr/local/etc/vmrc.conf is not readable. Exiting ; exit 1 ; }
+sh -n /usr/local/etc/vmrc.conf >/dev/null 2>&1 || \
+	{ echo /usr/local/etc/vmrc.conf failed to parse. Exiting ; exit 1 ; }
+. /usr/local/etc/vmrc.conf >/dev/null 2>&1 || \
+	{ echo /usr/local/etc/vmrc.conf failed to source. Exiting ; exit 1 ; }
 
-load_rc_config $name
+# NB! Consider adding more vmrc.conf validation tests from install/mkvm
 
-: ${vm_enable:="NO"}
+# Test 1: Verify if the host_vmdir set in vmrc.conf is readable (exists)
+[ -r $host_vmdir ] || { echo $host_vmdir is not readable. Exiting ; exit 1 ; }
+# NB! Verify this test
 
-run_rc_command "$vm_cmd"
+# RC BOILERPLATE
 
-########################################################################
-# END
-########################################################################
+: ${vm_enable="NO"}
+
+load_rc_config ${name}
+#run_rc_command "$1"
+run_rc_command "$vm_rc_command"
