@@ -19,10 +19,10 @@
 ############################################################ INFORMATION
 #
 # Title: virtual machine rc script
-# Version: v.0.9.7
+# Version: v.0.9.8
 #
 # PROVIDE: vm
-# REQUIRE: DAEMON
+# REQUIRE: LOGIN DAEMON
 # KEYWORD: shutdown
 #
 # Add the following line to /etc/rc.conf to enable vmrc:
@@ -527,7 +527,7 @@ fi
 # ada1 is now named ada0 and the fstab is wrong
 case $disk0_type in
 	dev)
-echo "	-s $disk0bus,$disk0_virtio,$disk0device \\" >> $bootscript
+echo "	-s $disk0bus,$disk0_virtio,$disk0_device \\" >> $bootscript
 	;;
 	img)
 echo "	-s $disk0bus,$disk0_virtio,$host_vmdir/$vmname/disk0.img \\" \
